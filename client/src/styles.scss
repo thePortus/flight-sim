@@ -1,0 +1,64 @@
+// import style settings
+@use 'sass:map';
+@use 'styles-settings' as settings;
+@use '_theme-colors' as theme-colors;
+/* tailwind directives */
+@use "tailwindcss";
+
+// include angular material styles
+@use '@angular/material' as mat;
+@include mat.core();
+
+// import google material icons
+@import 'https://fonts.googleapis.com/icon?family=Material+Icons';
+
+/* start of Angular Material color and font theming */
+
+html, body { height: 100%; }
+body { margin: 0; }
+
+$custom-color: (
+    primary: theme-colors.$primary-palette,
+    tertiary: theme-colors.$tertiary-palette,
+);
+
+$custom-typography: (
+    plain-family: settings.$body-typography-family,
+    brand-family: settings.$title-typography-family,
+    bold-weight: 900,
+    medium-weight: 400,
+    regular-weight: 300
+);
+
+$custom-theme: (
+    color: $custom-color,
+    typography: $custom-typography,
+    density: 0
+);
+
+html {
+    color-scheme: light; //dark;
+    font-family: settings.$body-typography-family;
+    @include mat.theme($custom-theme);
+}
+
+h1, h2, h3, h4, h5, h6 {
+    margin: 10px 0px 0px 0px;
+    font-family: settings.$title-typography-family;
+}
+
+p {
+    margin: 2px 0px 2px 0px;;
+}
+
+.light-field-background {
+    background-color: map.get(theme-colors.$primary-palette, 98) !important;
+}
+
+.popover {
+  z-index: 1000;
+  background: white;
+  border: 1px solid #ccc;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+  padding: 16px;
+}

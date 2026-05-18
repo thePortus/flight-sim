@@ -1,0 +1,73 @@
+<div class="auth-wrapper flex flex-col justify-center items-center">
+  <!-- only displays if user is not logged in -->
+  <form #myform="ngForm" (ngSubmit)="onSubmit(myform)" *ngIf="!this.user.loggedIn">
+    <mat-card class="auth-container">
+      <mat-card-header class="rounded-t-lg p-2 mb-2">
+        <mat-card-title>Register</mat-card-title>
+      </mat-card-header>
+      <mat-card-content>
+        <div class="flex flex-col justify-center items-center">
+          <!-- username -->
+          <div>
+            <mat-form-field appearance="fill">
+              <mat-label>Username</mat-label>
+              <input matInput type="text" name="username" placeholder="Enter Username" ngModel>
+            </mat-form-field>
+          </div>
+          <!-- email -->
+          <div>
+            <mat-form-field appearance="fill">
+              <mat-label>Email</mat-label>
+              <input matInput type="email" name="email" placeholder="Enter Email" ngModel>
+            </mat-form-field>
+          </div>
+          <!-- password -->
+          <div>
+            <mat-form-field appearance="fill">
+              <mat-label>Password</mat-label>
+              <input matInput type="password" name="password" placeholder="Enter Password" ngModel>
+            </mat-form-field>
+          </div>
+          <!-- confirm password -->
+          <div>
+            <mat-form-field appearance="fill">
+              <mat-label>Confirm Password</mat-label>
+              <input matInput type="password" name="password2" placeholder="Confirm Password" ngModel>
+            </mat-form-field>
+          </div>
+          <!-- error messsages -->
+          <div class="error-message" *ngIf="showErrorMessage">
+              {{ errorMessage }}
+          </div>
+        </div>
+      </mat-card-content>
+      <!-- register button -->
+      <mat-card-actions>
+        <div class="w-full flex flex-col justify-center items-center">
+          <button class="w-full" mat-raised-button type="submit" color="primary" aria-label="Register Button">Register</button>
+        </div>
+      </mat-card-actions>
+    </mat-card>
+    <!-- private policy link -->
+    <div class="policy-links flex flex-col justify-center items-center">
+      <div class="policy-links flex flex-col justify-center items-center">
+          <span><small><a routerLink='/privacy-policy'>View Privacy Policy</a></small></span>
+      </div>
+    </div>
+  </form>
+  <!-- only displays if user is logged in -->
+  <mat-card class="auth-container" *ngIf="this.user.loggedIn">
+    <mat-card-content ngFlex>
+      <h1>You are logged in</h1>
+      <div class="flex flex-col justify-center items-center">
+        <button mat-raised-button type="submit" color="primary" (click)="logout()" aria-label="Logout Button">Logout</button>
+      </div>
+      <div class="policy-links flex flex-col justify-center items-center">
+        <div class="policy-links flex flex-col justify-center items-center">
+            <span><small><a routerLink='/privacy-policy'>View Privacy Policy</a></small></span>
+        </div>
+      </div>
+    </mat-card-content>
+  </mat-card>
+    </div>
+  

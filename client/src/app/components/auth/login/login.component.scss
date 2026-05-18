@@ -1,0 +1,44 @@
+@use 'sass:map';
+@use '../../../../_theme-colors' as theme-colors;
+
+@use './../../../../styles-settings' as settings;
+
+:host .auth-wrapper {
+  height: 100%;
+  width: 100%;
+}
+
+// If the screen size is 601px wide or more, set for large screen
+@media screen and (min-width: 601px) {
+  :host .auth-container {
+    width: 800px;
+  }
+}
+
+// If the screen size is 600px wide or less, set for mobile
+@media screen and (max-width: 600px) {
+  :host .auth-container {
+    width: 350px;
+  }
+}
+
+:host mat-form-field {
+  width: 100%;
+}
+
+:host .error-msgs {
+  background-color: settings.$error-msg-bg-color;
+  color: settings.$error-msg-color;
+  margin: 5px;
+  padding: 5px;
+}
+
+
+
+:host {
+
+    mat-card-header {
+        background-color: map.get(theme-colors.$primary-palette, 50);
+        color: map.get(theme-colors.$primary-palette, 99);
+    }
+}

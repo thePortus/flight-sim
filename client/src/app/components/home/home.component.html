@@ -1,0 +1,46 @@
+<div class="home-container">
+  <div class="home-card">
+    <h1>Flight Simulator</h1>
+    <p class="subtitle">A multiplayer flight simulator — early access</p>
+
+    <div class="plane-selector" *ngIf="planes.length > 0">
+      <h3>Select Aircraft</h3>
+      <div class="plane-options">
+        <button *ngFor="let p of planes"
+                class="plane-option"
+                [class.selected]="selectedSlug === p.slug"
+                (click)="selectPlane(p.slug)">
+          {{ p.name }}
+        </button>
+      </div>
+    </div>
+
+    <a class="btn btn-primary" routerLink="/game">Fly Now</a>
+
+    <div class="auth-links" *ngIf="!user?.loggedIn">
+      <a routerLink="/login">Login</a>
+      <span>·</span>
+      <a routerLink="/register">Register</a>
+    </div>
+
+    <div class="auth-links" *ngIf="user?.loggedIn">
+      <span>{{ user?.username }}</span>
+      <span>·</span>
+      <a routerLink="/profile">Profile</a>
+      <span>·</span>
+      <button (click)="logout()">Logout</button>
+    </div>
+
+    <div class="controls-preview">
+      <h3>Controls</h3>
+      <table>
+        <tr><td>W / S</td><td>Pitch nose up / down</td></tr>
+        <tr><td>A / D</td><td>Roll left / right</td></tr>
+        <tr><td>Q / E</td><td>Yaw left / right (rudder)</td></tr>
+        <tr><td>Shift</td><td>Accelerate</td></tr>
+        <tr><td>Space</td><td>Stop</td></tr>
+        <tr><td>V</td><td>Toggle camera (3rd / 1st person)</td></tr>
+      </table>
+    </div>
+  </div>
+</div>

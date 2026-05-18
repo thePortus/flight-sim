@@ -1,0 +1,88 @@
+services:
+  mysqldb-prod:
+    image: docker.io/mysql:5.7
+    container_name: flight-sim-mysqldb-prod
+    restart: unless-stopped
+    platform: linux/x86_64
+    environment:
+      - MYSQL_ROOT_PASSWORD=123456
+      - MYSQL_DATABASE=flight-sim
+    ports:
+      - 4307:3306
+    volumes:
+      - db-prod:/var/lib/mysql
+    networks:
+      - server-network
+
+  mysqldb-dev:
+    image: mysql:5.7
+    container_name: flight-sim-mysqldb-dev
+    restart: unless-stopped
+    platform: linux/x86_64
+    environment:
+      - MYSQL_ROOT_PASSWORD=123456
+      - MYSQL_DATABASE=flight-sim
+    ports:
+      - 4308:3306
+    volumes:
+      - db-dev:/var/lib/mysql
+    networks:
+      - server-network
+
+  nodejs-prod:
+    container_name: flight-sim-nodejs-prod
+    depends_on:
+      - mysqldb-prod
+    build: server/
+    restart: unless-stopped
+    ports:
+      - 9080:8080
+    environment:
+      - DB_HOST=mysqldb-prod
+      - DB_USER=root
+      - DB_PASSWORD=123456
+      - DB_NAME=flight-sim
+      - DB_LOCAL_PORT=4307
+      - DB_PORT=3306
+      - WEB_PORT=8080
+      - JWT_SECRET=secret
+      - OWNER_USERNAME=admin
+      - OWNER_PASSWORD=123456
+      - OWNER_EMAIL=admin@flight-sim.local
+    stdin_open: true
+    tty: true
+    networks:
+      - server-network
+
+  nodejs-dev:
+    container_name: flight-sim-nodejs-dev
+    depends_on:
+      - mysqldb-dev
+    build: server/
+    restart: unless-stopped
+    ports:
+      - 9081:8080
+    environment:
+      - DB_HOST=mysqldb-dev
+      - DB_USER=root
+      - DB_PASSWORD=123456
+      - DB_NAME=flight-sim
+      - DB_LOCAL_PORT=4308
+      - DB_PORT=3306
+      - WEB_PORT=8080
+      - JWT_SECRET=secret
+      - OWNER_USERNAME=admin
+      - OWNER_PASSWORD=password
+      - OWNER_EMAIL=admin@flight-sim.local
+    stdin_open: true
+    tty: true
+    networks:
+      - server-network
+
+volumes:
+  db-prod:
+  db-dev:
+
+networks:
+  server-network:
+    driver: bridge
