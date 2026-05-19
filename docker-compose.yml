@@ -79,6 +79,32 @@ services:
     networks:
       - server-network
 
+  angular-prod:
+    container_name: flight-sim-angular-prod
+    build:
+      context: client/
+      args:
+        - BUILD_CONFIG=production
+        - BASE_HREF=/
+    restart: unless-stopped
+    ports:
+      - 9082:80
+    networks:
+      - server-network
+
+  angular-dev:
+    container_name: flight-sim-angular-dev
+    build:
+      context: client/
+      args:
+        - BUILD_CONFIG=development
+        - BASE_HREF=/dev/
+    restart: unless-stopped
+    ports:
+      - 9083:80
+    networks:
+      - server-network
+
 volumes:
   db-prod:
   db-dev:

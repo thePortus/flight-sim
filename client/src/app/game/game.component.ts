@@ -608,20 +608,41 @@ export class GameComponent implements OnInit, OnDestroy {
   private INITIAL_THROTTLE = 0.0;  // player must throttle up to take off
   private ACCELERATION     = 60;   // max thrust force (units/s²)
   private THROTTLE_RATE             = 0.40; // throttle change per second — overridden per-plane
-  private DRAG_K           = 0.12; // drag = DRAG_K × speed
+  private DRAG_K           = 0.12; // drag deceleration = DRAG_K × speed (m/s²), opposing velocity
   private MAX_SPEED        = 400;  // units/s
-  private ROT_SPEED        = 1.4;  // radians/s — overridden per-plane
+  private ROT_SPEED        = 1.4;  // max rotation rate (rad/s) — overridden per-plane
+  private ROT_DAMPING      = 4.0;  // aerodynamic damping (higher = stops faster on release)
 
   // ── Flight physics — Cessna 172 rough approximation ─────────────────────
   // Level flight (lift = gravity) at cruise ≈ 250 u/s.
   // Stall ≈ 125 u/s  (C172 stall:cruise ratio ≈ 50%).
   // Banking reduces the world-Y lift component naturally.
   private readonly GRAVITY      = 10;       // world-Y gravity        (units/s²)
-  private LIFT_K       = 0.00016;  // lift = LIFT_K × v², balanced @ 250 u/s
-  private STALL_SPEED  = 125;      // below this → stall warning on HUD
+  private LIFT_K       = 0.00016;  // lift = LIFT_K × CL × v², balanced @ 250 u/s with CL = 1
+  private STALL_SPEED  = 125;      // minimum safe airspeed (below this → stall warning on HUD)
   private WEIGHT       = 1.0;      // per-plane gravity/lift multiplier (1 = Cessna baseline)
   private GROUND_OFFSET = 1.60;    // plane-center height above ground surface (Cessna default)
-  private physicsVY             = 0;        // lift/gravity vertical velocity (units/s)
+
+  // World-space velocity vector — replaces the scalar speed + physicsVY decomposition.
+  // All aerodynamic forces (thrust, drag, lift, gravity) act on this vector directly,
+  // enabling physically correct 3D flight including banked turns, inverted flight,
+  // realistic stall recovery, and proper gravity in dives.
+  private velocity = new Vector3(0, 0, 0);
+
+  // Angular velocity for rotational inertia — components are rad/s on the
+  // aircraft's local axes: x = pitch, z = roll, y = yaw.
+  // Input accelerates angular velocity toward ±ROT_SPEED; aerodynamic damping
+  // decays it to zero when controls are released so the aircraft carries its
+  // rotation briefly, like a real aircraft would.
+  private rotVelocity = new Vector3(0, 0, 0);
+
+  // AoA-based lift coefficient model.
+  // CL is normalised so that CL = 1.0 when the nose is aligned with the velocity
+  // vector (AoA = 0°), which preserves all existing per-plane liftK tuning.
+  // CL rises linearly with nose-up AoA up to the stall angle, then drops sharply.
+  private readonly CL_ALPHA       = 2.5;   // lift slope (per radian of AoA)
+  private readonly CL_STALL_ONSET = 0.20;  // AoA (rad, ~11.5°) where stall starts; CL peaks here
+  private readonly CL_MIN         = 0.15;  // post-stall / negative-AoA floor
 
   // ── Weather ───────────────────────────────────────────────────────────────
   weather:                GameWeather | null = null;
@@ -979,31 +1000,48 @@ export class GameComponent implements OnInit, OnDestroy {
     if (this.retractableGear) this.updateGear(dt);
     if (this.crashed) return;
 
-    const rotRate = this.ROT_SPEED * dt;
+    // ── Rotational inertia ────────────────────────────────────────────────────
+    // Input accelerates angular velocity toward the plane's max rotation rate.
+    // When no input is held, aerodynamic damping decays rotation back to zero.
+    // This gives realistic carry-through: the aircraft keeps rotating briefly
+    // after releasing the stick, and a counter-input is needed to stop a roll.
+    const rotAccel = this.ROT_SPEED * 5.0;  // reach max rate in ~0.2 s
 
-    // Pitch
+    // Pitch (X axis)
     if (this.keys.has('w') || this.keys.has('W')) {
-      this.planeMesh.rotate(Axis.X, rotRate, Space.LOCAL);
-    }
-    if (this.keys.has('s') || this.keys.has('S')) {
-      this.planeMesh.rotate(Axis.X,  -rotRate, Space.LOCAL);
+      this.rotVelocity.x = Math.min( this.ROT_SPEED, this.rotVelocity.x + rotAccel * dt);
+    } else if (this.keys.has('s') || this.keys.has('S')) {
+      this.rotVelocity.x = Math.max(-this.ROT_SPEED, this.rotVelocity.x - rotAccel * dt);
     }
 
-    // Roll
+    // Roll (Z axis)
     if (this.keys.has('a') || this.keys.has('A')) {
-      this.planeMesh.rotate(Axis.Z,  rotRate, Space.LOCAL);
-    }
-    if (this.keys.has('d') || this.keys.has('D')) {
-      this.planeMesh.rotate(Axis.Z, -rotRate, Space.LOCAL);
+      this.rotVelocity.z = Math.min( this.ROT_SPEED, this.rotVelocity.z + rotAccel * dt);
+    } else if (this.keys.has('d') || this.keys.has('D')) {
+      this.rotVelocity.z = Math.max(-this.ROT_SPEED, this.rotVelocity.z - rotAccel * dt);
     }
 
-    // Yaw (rudder)
+    // Yaw (Y axis)
     if (this.keys.has('q') || this.keys.has('Q')) {
-      this.planeMesh.rotate(Axis.Y, -rotRate, Space.LOCAL);
+      this.rotVelocity.y = Math.max(-this.ROT_SPEED, this.rotVelocity.y - rotAccel * dt);
+    } else if (this.keys.has('e') || this.keys.has('E')) {
+      this.rotVelocity.y = Math.min( this.ROT_SPEED, this.rotVelocity.y + rotAccel * dt);
     }
-    if (this.keys.has('e') || this.keys.has('E')) {
-      this.planeMesh.rotate(Axis.Y,  rotRate, Space.LOCAL);
-    }
+
+    // Aerodynamic damping — decays rotation when no input (or opposing input
+    // is not yet held). The damping coefficient scales with airspeed so faster
+    // flight gives crisper control response and tighter handling.
+    const speedDamp  = 1.0 + this.speed * 0.002;       // gentle speed scaling
+    const dampFactor = Math.max(0, 1 - this.ROT_DAMPING * speedDamp * dt);
+    this.rotVelocity.scaleInPlace(dampFactor);
+
+    // Apply angular velocity to the mesh
+    if (Math.abs(this.rotVelocity.x) > 0.0001)
+      this.planeMesh.rotate(Axis.X, this.rotVelocity.x * dt, Space.LOCAL);
+    if (Math.abs(this.rotVelocity.z) > 0.0001)
+      this.planeMesh.rotate(Axis.Z, this.rotVelocity.z * dt, Space.LOCAL);
+    if (Math.abs(this.rotVelocity.y) > 0.0001)
+      this.planeMesh.rotate(Axis.Y, this.rotVelocity.y * dt, Space.LOCAL);
 
     // Throttle — Shift ramps up, Control ramps down; setting persists between frames
     if (this.keys.has('Shift')) {
@@ -1024,21 +1062,112 @@ export class GameComponent implements OnInit, OnDestroy {
       this.tracerFireTimer = 0; // reset so next press fires immediately
     }
 
-    const thrust = this.ACCELERATION * this.throttle;
-    const drag   = this.DRAG_K * this.speed;
-    // When airborne, gravity accelerates when nose-down and decelerates when nose-up.
-    // localFwd.y > 0 = nose-up (gravity opposes motion), < 0 = nose-down (gravity aids it).
-    // The 4× factor balances the game's drag scale so a 45–60° dive gives noticeable
-    // speed gain; gravity acceleration is mass-independent (F=ma cancels).
-    const gravComponent = !this.landed
-      ? -this.GRAVITY * this.planeMesh.getDirection(Axis.Z).y * 4
-      : 0;
-    this.speed   = Math.max(0, Math.min(this.speed + (thrust - drag + gravComponent) * dt, this.MAX_SPEED));
+    // ── Physics engine ───────────────────────────────────────────────────────
+    // Uses a world-space velocity vector so all forces (thrust, drag, gravity,
+    // lift) act in 3D. This fixes gravity in dives/climbs and enables proper
+    // banked turns, energy management, and AoA-based lift coefficient.
 
-    // Translate forward along local +Z
-    if (this.speed !== 0) {
-      this.planeMesh.translate(Axis.Z, this.speed * dt, Space.LOCAL);
+    const fwd   = this.planeMesh.getDirection(Axis.Z);   // nose direction
+    const up    = this.planeMesh.getDirection(Axis.Y);   // wing-up direction
+    const right = this.planeMesh.getDirection(Axis.X);   // right-wing direction
+    const speed = this.velocity.length();
+    const velNorm = speed > 0.5 ? this.velocity.scale(1 / speed) : fwd.clone();
+
+    // Angle of Attack: pitch angle of nose minus pitch angle of the velocity
+    // vector (flight path angle). Positive = nose above flight path (lift-generating).
+    const nosePitch = Math.asin(Math.max(-1, Math.min(1, fwd.y)));
+    const velPitch  = Math.asin(Math.max(-1, Math.min(1, velNorm.y)));
+    const AoA       = nosePitch - velPitch;
+
+    // Lift Coefficient — normalised to CL = 1.0 at AoA = 0 (preserves existing
+    // per-plane liftK tuning). Rises with AoA up to stall, then drops sharply.
+    let CL: number;
+    if (AoA < -0.15) {
+      CL = this.CL_MIN;                                           // well below zero-lift angle
+    } else if (AoA <= this.CL_STALL_ONSET) {
+      CL = Math.max(this.CL_MIN, 1.0 + this.CL_ALPHA * AoA);    // linear lift slope
+    } else {
+      // Post-stall: linear drop from peak CL back to CL_MIN over 0.15 rad
+      const peakCL   = 1.0 + this.CL_ALPHA * this.CL_STALL_ONSET;
+      const progress = Math.min(1.0, (AoA - this.CL_STALL_ONSET) / 0.15);
+      CL = Math.max(this.CL_MIN, peakCL + (this.CL_MIN - peakCL) * progress);
     }
+
+    // Lift direction: perpendicular to velocity and to the wing span.
+    // When banked, lift tilts with the aircraft, reducing the vertical component
+    // and producing centripetal force for coordinated turns automatically.
+    let liftDir: Vector3;
+    if (speed > 0.5) {
+      const ld = Vector3.Cross(velNorm, right);
+      liftDir = ld.length() > 0.001 ? ld.normalize() : up.clone();
+    } else {
+      liftDir = up.clone();
+    }
+
+    if (this.landed) {
+      // ── Ground roll ────────────────────────────────────────────────────────
+      // On the ground, only thrust and drag act; gravity is absorbed by the
+      // runway surface. Velocity stays aligned with the nose direction.
+      const thrustAccel = this.ACCELERATION * this.throttle;
+      const dragAccel   = this.DRAG_K * speed;
+      const groundSpeed = Math.max(0, Math.min(speed + (thrustAccel - dragAccel) * dt, this.MAX_SPEED));
+      this.velocity = fwd.scale(groundSpeed);
+
+      this.planeMesh.position.addInPlace(this.velocity.scale(dt));
+      const groundY = Math.max(
+        this.getTerrainHeightAt(this.planeMesh.position.x, this.planeMesh.position.z), 0);
+      this.planeMesh.position.y = groundY + this.GROUND_OFFSET;
+
+      // Auto-liftoff: as soon as lift force exceeds weight, break ground contact.
+      if (this.LIFT_K * this.WEIGHT * groundSpeed * groundSpeed > this.GRAVITY * this.WEIGHT) {
+        this.landed = false;
+        this.liftoffGraceTimer = 3.0;  // 3 s before building collisions re-enable
+        this.ngZone.run(() => { this.landedAt = ''; });
+      }
+    } else {
+      // ── Airborne flight ────────────────────────────────────────────────────
+      // 1. Thrust — along nose direction
+      this.velocity.addInPlace(fwd.scale(this.ACCELERATION * this.throttle * dt));
+      // 2. Drag — opposing velocity, linear in airspeed (preserves existing tuning)
+      this.velocity.addInPlace(velNorm.scale(-this.DRAG_K * speed * dt));
+      // 3. Gravity — world -Y always pulling the aircraft down
+      this.velocity.y -= this.GRAVITY * this.WEIGHT * dt;
+      // 4. Lift — perpendicular to velocity, scaled by AoA-dependent CL
+      const liftAccel = this.LIFT_K * CL * speed * speed;
+      this.velocity.addInPlace(liftDir.scale(liftAccel * dt));
+
+      // ── Directional stability (weathervane effect) ───────────────────────
+      // The fuselage and tail surfaces keep the aircraft aligned with its heading.
+      // Horizontal (X/Z) velocity is blended toward the nose heading direction
+      // so the aircraft cannot sideslip or fly backwards during fast turns.
+      // Vertical velocity is left untouched so gravity and lift work correctly.
+      //
+      // Rate scales with airspeed — a faster aircraft has stronger aerodynamic
+      // restoring forces (larger dynamic pressure on the tail surfaces).
+      const fwdH    = new Vector3(fwd.x, 0, fwd.z);
+      const fwdHLen = fwdH.length();
+      const velHorizSpd = Math.sqrt(this.velocity.x * this.velocity.x +
+                                    this.velocity.z * this.velocity.z);
+      if (fwdHLen > 0.10 && velHorizSpd > 0.5) {
+        const fwdHN     = fwdH.scale(1 / fwdHLen);
+        // Target horizontal velocity: same horizontal speed, but in nose direction
+        const targetVx  = fwdHN.x * velHorizSpd;
+        const targetVz  = fwdHN.z * velHorizSpd;
+        // Alignment rate: stronger at higher speed, capped to avoid snapping
+        const alignRate = Math.min(1.0, (2.0 + speed * 0.016) * dt);
+        this.velocity.x += (targetVx - this.velocity.x) * alignRate;
+        this.velocity.z += (targetVz - this.velocity.z) * alignRate;
+      }
+
+      // Clamp to max airspeed
+      const newSpeed = this.velocity.length();
+      if (newSpeed > this.MAX_SPEED) this.velocity.scaleInPlace(this.MAX_SPEED / newSpeed);
+
+      this.planeMesh.position.addInPlace(this.velocity.scale(dt));
+    }
+
+    // Update public speed scalar (HUD, landing checks, bomb/gun inherit velocity)
+    this.speed = this.velocity.length();
 
     // Spin propellers: 30 rad/s at idle, 300 rad/s at full throttle
     for (const p of this.propMeshes) {
@@ -1056,34 +1185,18 @@ export class GameComponent implements OnInit, OnDestroy {
 
     // Altimeter — height above ground (y=0)
     this.altitude = Math.max(0, this.planeMesh.position.y);
-    if (this.landed) {
-      // Ground roll: clamp plane to terrain surface at correct wheel height.
-      const groundY = Math.max(
-        this.getTerrainHeightAt(this.planeMesh.position.x, this.planeMesh.position.z), 0);
-      this.planeMesh.position.y = groundY + this.GROUND_OFFSET;
-      this.physicsVY = 0;
-      // Auto-liftoff: as soon as lift force exceeds gravity the plane breaks ground contact.
-      // No key press needed — just build speed with Shift.
-      if (this.LIFT_K * this.WEIGHT * this.speed * this.speed > this.GRAVITY * this.WEIGHT) {
-        this.landed = false;
-        this.liftoffGraceTimer = 3.0;  // 3 s before building collisions re-enable
-        this.ngZone.run(() => { this.landedAt = ''; });
-      }
-    } else {
-      // Normal flight: lift along local Y, world-Y component counteracts gravity.
-      const localUp = this.planeMesh.getDirection(Axis.Y);
-      const liftY   = this.LIFT_K * this.WEIGHT * this.speed * this.speed * localUp.y;
-      this.physicsVY += (liftY - this.GRAVITY * this.WEIGHT) * dt;
-      this.physicsVY -= this.physicsVY * 0.28 * dt;
-      this.planeMesh.position.y += this.physicsVY * dt;
-    }
 
-    this.stalling = this.speed < this.STALL_SPEED && this.altitude > 5 && !this.landed;
-    // Stall nose-drop: pitch forward proportional to speed deficit so the
-    // plane naturally recovers if the player dives to rebuild airspeed.
+    // ── Stall ────────────────────────────────────────────────────────────────
+    // Stall when AoA exceeds the critical angle OR airspeed falls below stall speed.
+    this.stalling = !this.landed && this.altitude > 5 &&
+      (AoA > this.CL_STALL_ONSET || this.speed < this.STALL_SPEED);
     if (this.stalling) {
-      const deficit = (this.STALL_SPEED - this.speed) / this.STALL_SPEED;
-      this.planeMesh.rotate(Axis.X, deficit * 0.45 * dt, Space.LOCAL);
+      // Nose-drop proportional to stall severity; gravity then naturally rebuilds
+      // airspeed once the nose drops, enabling realistic stall recovery.
+      const aoa_excess    = Math.max(0, AoA - this.CL_STALL_ONSET);
+      const speed_deficit = Math.max(0, this.STALL_SPEED - this.speed) / this.STALL_SPEED;
+      const stallRate     = Math.max(aoa_excess * 2.0, speed_deficit * 0.45);
+      this.planeMesh.rotate(Axis.X, stallRate * dt, Space.LOCAL);
     }
 
     // ── Weather effects ───────────────────────────────────────────────────────
@@ -1096,7 +1209,7 @@ export class GameComponent implements OnInit, OnDestroy {
         const t = this.weather.turbulence;
         this.planeMesh.rotate(Axis.X, (Math.random() - 0.5) * t * 0.004, Space.LOCAL);
         this.planeMesh.rotate(Axis.Z, (Math.random() - 0.5) * t * 0.004, Space.LOCAL);
-        this.physicsVY += (Math.random() - 0.5) * t * 4 * dt;
+        this.velocity.y += (Math.random() - 0.5) * t * 4 * dt;
       }
     }
 
@@ -1515,15 +1628,15 @@ export class GameComponent implements OnInit, OnDestroy {
     if (py > rw.elevation + 8 || py < rw.elevation - 1) return false;
     if (!this.isOnRunway(rw)) return false;
     if (this.speed > 240) return false;
-    if (this.physicsVY < -20) return false;
-    if (this.physicsVY > 3) return false;
+    if (this.velocity.y < -20) return false;
+    if (this.velocity.y > 3) return false;
     const localUp = this.planeMesh.getDirection(Axis.Y);
     return localUp.y > 0.85;
   }
 
   private performLanding(airport: GameAirport): void {
     this.landed    = true;
-    this.physicsVY = 0;
+    this.velocity.y = 0;
     this.planeMesh.position.y = airport.elevation + this.GROUND_OFFSET;
     // Auto-extend gear on touchdown so it is always down after landing
     if (this.retractableGear && !this.gearDown) {
@@ -1656,8 +1769,7 @@ export class GameComponent implements OnInit, OnDestroy {
     const worldPos = Vector3.TransformCoordinates(new Vector3(lp.x, lp.y, lp.z), wm);
 
     // Bomb inherits the aircraft's full world-space velocity
-    const forward  = this.planeMesh.getDirection(Axis.Z);
-    const velocity = forward.scale(this.speed);
+    const velocity = this.velocity.clone();
     velocity.y    -= 1.5; // small ejection nudge downward
 
     // ── Build bomb mesh (cylinders parented to a TransformNode) ───────────
@@ -2017,7 +2129,7 @@ export class GameComponent implements OnInit, OnDestroy {
     if (this.gunPositions.length === 0) return;
     const wm      = this.planeMesh.getWorldMatrix();
     const forward = this.planeMesh.getDirection(Axis.Z);
-    const velocity = forward.scale(this.speed + this.TRACER_SPEED);
+    const velocity = this.velocity.add(forward.scale(this.TRACER_SPEED));
 
     // Collect world-space gun origins so we can broadcast them
     const gunData: { x: number; y: number; z: number; vx: number; vy: number; vz: number }[] = [];
@@ -2313,6 +2425,8 @@ export class GameComponent implements OnInit, OnDestroy {
     this.crashed      = true;
     this.crashMessage = message;
     this.speed        = 0;
+    this.velocity.setAll(0);
+    this.rotVelocity.setAll(0);
     // Delay the overlay so the explosion plays for ~2 seconds first
     setTimeout(() => this.ngZone.run(() => { this.crashBoxVisible = true; }), 2000);
     // Switch to 3rd-person so the wreckage is visible
@@ -2352,9 +2466,8 @@ export class GameComponent implements OnInit, OnDestroy {
 
   // ── Crash explosion — scatter parts + start fire / smoke ─────────────────
   private triggerCrashAnimation(): void {
-    const crashPos   = this.planeMesh.position.clone();
-    const forward    = this.planeMesh.getDirection(Axis.Z);
-    const crashSpeed = this.speed;
+    const crashPos      = this.planeMesh.position.clone();
+    const crashVelocity = this.velocity.clone();
 
     // Detach all plane parts and turn them into physics debris
     const allParts = [...this.planeParts, ...this.cockpitParts];
@@ -2371,11 +2484,11 @@ export class GameComponent implements OnInit, OnDestroy {
       mesh.rotationQuaternion = worldQuat;
       mesh.layerMask          = 0x0FFFFFFF; // visible in orbit (3rd-person) camera
 
-      // Velocity: forward momentum from crash speed + random scatter + upward burst
+      // Velocity: forward momentum from crash velocity + random scatter + upward burst
       const vel = new Vector3(
-        forward.x * crashSpeed * 0.10 + (Math.random() - 0.5) * 26,
+        crashVelocity.x * 0.10 + (Math.random() - 0.5) * 26,
         3 + Math.random() * 22,
-        forward.z * crashSpeed * 0.10 + (Math.random() - 0.5) * 26,
+        crashVelocity.z * 0.10 + (Math.random() - 0.5) * 26,
       );
       const ang = new Vector3(
         (Math.random() - 0.5) * 14,
@@ -2461,9 +2574,9 @@ export class GameComponent implements OnInit, OnDestroy {
     this.planeMesh.position           = new Vector3(0, this.GROUND_OFFSET, -900);
     this.planeMesh.rotationQuaternion = Quaternion.Identity();
     this.speed        = 0;
+    this.velocity.setAll(0);
+    this.rotVelocity.setAll(0);
     this.throttle     = 0;
-    this.altitude     = 0;
-    this.physicsVY    = 0;
     this.stalling     = false;
     this.crashed      = false;
     this.crashMessage = '';
@@ -2528,8 +2641,9 @@ export class GameComponent implements OnInit, OnDestroy {
 
   private resetFlight(): void {
     this.speed    = 0;
+    this.velocity.setAll(0);
+    this.rotVelocity.setAll(0);
     this.throttle = 0;
-    this.physicsVY = 0;
     this.crashed   = false;
     this.stalling  = false;
     this.planeMesh.position = new Vector3(0, this.GROUND_OFFSET, -900);
