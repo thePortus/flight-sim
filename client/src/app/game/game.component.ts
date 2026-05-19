@@ -776,17 +776,6 @@ export class GameComponent implements OnInit, OnDestroy {
     sunMat.disableLighting  = true;
     sunSphere.material = sunMat;
 
-    // Base ground — large fallback plane at sea level (visible beyond terrain tile range)
-    const ground    = MeshBuilder.CreateGround('ground', { width: 20000, height: 20000, subdivisions: 1 }, scene);
-    const baseTex   = this.createGrassTexture(scene);
-    baseTex.uScale  = 80;
-    baseTex.vScale  = 80;
-    const groundMat = new StandardMaterial('groundMat', scene);
-    groundMat.diffuseTexture = baseTex;
-    ground.material   = groundMat;
-    ground.position.y = -0.6;  // sink below terrain tiles to eliminate z-fighting
-    ground.isPickable = false;
-
     // Grassland terrain-tile material (shared across all grassland tiles)
     this.grasslandMat = new StandardMaterial('grasslandMat', scene);
     const grassTex    = this.createGrassTexture(scene);
@@ -1200,7 +1189,7 @@ export class GameComponent implements OnInit, OnDestroy {
     }
 
     // ── Weather effects ───────────────────────────────────────────────────────
-    if (this.weather && this.altitude > 2) {
+    if (this.weather && !this.landed && this.altitude > 2) {
       // Wind drift in world space
       this.planeMesh.position.x += this.weather.wind.x * dt;
       this.planeMesh.position.z += this.weather.wind.z * dt;

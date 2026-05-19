@@ -1,7 +1,7 @@
-// Docker dev build — served at https://flight-sim.theport.us/dev/
+// Default environment — used by `ng serve` (local development)
 export const environment = {
   production: false,
-  siteUrl: 'https://flight-sim.theport.us/dev/',
-  apiUrl:  '/api/dev/',
-  wsUrl:   'wss://flight-sim.theport.us',
+  siteUrl: 'http://localhost:4200/',
+  apiUrl:  'http://localhost:9080/',
+  wsUrl:   'ws://localhost:9080',
 };

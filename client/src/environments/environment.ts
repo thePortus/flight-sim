@@ -2,6 +2,6 @@
 export const environment = {
   production: false,
   siteUrl: 'http://localhost:4200/',
-  apiUrl:  'http://localhost:9080/api/',
+  apiUrl:  'http://localhost:9080/',
   wsUrl:   'ws://localhost:9080',
 };
