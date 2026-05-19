@@ -8,5 +8,5 @@ module.exports = app => {
   router.get('/',    limitRate, controller.findInArea);
   router.get('/all', limitRate, controller.findAll);
 
-  app.use('/api/structures', router);
+  app.use('/structures', router);
 };

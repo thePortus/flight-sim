@@ -10,5 +10,5 @@ module.exports = app => {
   // Returns road segments (highway and local) overlapping the given bbox
   router.get('/', limitRate, controller.getRoads);
 
-  app.use('/api/roads', router);
+  app.use('/roads', router);
 };

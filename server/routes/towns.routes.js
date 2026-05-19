@@ -8,5 +8,5 @@ module.exports = app => {
 
   router.get('/', limitRate, controller.getTowns);
 
-  app.use('/api/towns', router);
+  app.use('/towns', router);
 };

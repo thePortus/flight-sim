@@ -21,5 +21,5 @@ module.exports = app => {
   router.put('/update/:username', limitRate, auth.verifyToken, controller.update);
   // Delete
   router.delete('/delete/:username', limitRate, auth.verifyAdminToken, controller.delete);
-  app.use('/api/user', router);
+  app.use('/user', router);
 };

@@ -11,5 +11,5 @@ module.exports = app => {
   var router = require('express').Router();
   // Retrieve user profile
   router.get('/:username', limitRate, auth.verifyToken, controller.findOne);
-  app.use('/api/profile/', router);
+  app.use('/profile/', router);
 };

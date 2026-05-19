@@ -10,5 +10,5 @@ module.exports = app => {
   // Returns terrain tiles (heightmap + ground cover + tree positions) for the given bbox
   router.get('/', limitRate, controller.getTiles);
 
-  app.use('/api/terrain', router);
+  app.use('/terrain', router);
 };

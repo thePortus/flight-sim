@@ -10,5 +10,5 @@ module.exports = app => {
   router.get('/default', limitRate, controller.getDefaultPlane);
   router.get('/:slug',   limitRate, controller.getPlaneBySlug);
 
-  app.use('/api/planes', router);
+  app.use('/planes', router);
 };

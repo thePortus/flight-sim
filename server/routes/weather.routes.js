@@ -9,5 +9,5 @@ module.exports = app => {
   // GET /api/weather  — returns current computed weather conditions
   router.get('/', limitRate, controller.getWeather);
 
-  app.use('/api/weather', router);
+  app.use('/weather', router);
 };
