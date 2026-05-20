@@ -1,22 +1,17 @@
 'use strict';
 
-// Grid spacing (world units) for each road class
-const HW_SPACING    = 3000;  // highways — major arteries
-const LOCAL_SPACING = 1000;  // local roads — secondary grid
-
-// Deterministic stable segment ID from road class, direction, and grid coords
-function segId(type, direction, ix, iz) {
-  return `${type}_${direction}_${ix}_${iz}`;
-}
+const { RoadPath } = require('../models');
+const { Op }       = require('sequelize');
 
 /**
  * GET /api/roads?minX=&maxX=&minZ=&maxZ=
  *
- * Returns road segments whose bounding box overlaps the query area.
- * Segments always run between consecutive grid intersections so the same
- * segment gets the same ID regardless of which bbox was used to fetch it.
+ * Loads road paths from the DB, filters to those whose bounding box overlaps
+ * the query area, then breaks each polyline into straight segments using the
+ * same {id, x1, z1, x2, z2, width, type} shape the frontend already expects.
+ * Short segments (≤ 1000 u) produce naturally curved-looking roads from altitude.
  */
-exports.getRoads = (req, res) => {
+exports.getRoads = async (req, res) => {
   const minX = parseFloat(req.query.minX);
   const maxX = parseFloat(req.query.maxX);
   const minZ = parseFloat(req.query.minZ);
@@ -26,86 +21,43 @@ exports.getRoads = (req, res) => {
     return res.status(400).json({ message: 'minX, maxX, minZ, maxZ are required' });
   }
 
-  const roads = [];
+  try {
+    // Fetch all paths; filter in JS (JSON columns can't be range-queried easily)
+    const paths = await RoadPath.findAll();
 
-  // ── Highways N-S (constant X, segments between highway Z intersections) ──
-  const firstHX = Math.ceil(minX  / HW_SPACING);
-  const lastHX  = Math.floor(maxX / HW_SPACING);
-  for (let ix = firstHX; ix <= lastHX; ix++) {
-    const firstSeg = Math.floor(minZ / HW_SPACING);
-    const lastSeg  = Math.floor(maxZ / HW_SPACING);
-    for (let iz = firstSeg; iz <= lastSeg; iz++) {
-      roads.push({
-        id:    segId('hw', 'ns', ix, iz),
-        x1:    ix * HW_SPACING,
-        z1:    iz * HW_SPACING,
-        x2:    ix * HW_SPACING,
-        z2:    (iz + 1) * HW_SPACING,
-        width: 12,
-        type:  'highway',
-      });
+    const segments = [];
+    for (const path of paths) {
+      const pts = path.points;
+      if (!pts || pts.length < 2) continue;
+
+      // Quick AABB test: skip paths entirely outside the query bbox
+      let pMinX = Infinity, pMaxX = -Infinity, pMinZ = Infinity, pMaxZ = -Infinity;
+      for (const p of pts) {
+        if (p.x < pMinX) pMinX = p.x;
+        if (p.x > pMaxX) pMaxX = p.x;
+        if (p.z < pMinZ) pMinZ = p.z;
+        if (p.z > pMaxZ) pMaxZ = p.z;
+      }
+      if (pMaxX < minX || pMinX > maxX || pMaxZ < minZ || pMinZ > maxZ) continue;
+
+      const roadType = path.type === 'highway' ? 'highway' : 'local';
+      for (let i = 0; i < pts.length - 1; i++) {
+        const a = pts[i], b = pts[i + 1];
+        // Skip segments completely outside bbox
+        if (Math.max(a.x, b.x) < minX || Math.min(a.x, b.x) > maxX) continue;
+        if (Math.max(a.z, b.z) < minZ || Math.min(a.z, b.z) > maxZ) continue;
+        segments.push({
+          id:    `${path.id}_${i}`,
+          x1: a.x, z1: a.z,
+          x2: b.x, z2: b.z,
+          width: path.width,
+          type:  roadType,
+        });
+      }
     }
-  }
 
-  // ── Highways E-W (constant Z, segments between highway X intersections) ──
-  const firstHZ = Math.ceil(minZ  / HW_SPACING);
-  const lastHZ  = Math.floor(maxZ / HW_SPACING);
-  for (let iz = firstHZ; iz <= lastHZ; iz++) {
-    const firstSeg = Math.floor(minX / HW_SPACING);
-    const lastSeg  = Math.floor(maxX / HW_SPACING);
-    for (let ix = firstSeg; ix <= lastSeg; ix++) {
-      roads.push({
-        id:    segId('hw', 'ew', iz, ix),
-        x1:    ix * HW_SPACING,
-        z1:    iz * HW_SPACING,
-        x2:    (ix + 1) * HW_SPACING,
-        z2:    iz * HW_SPACING,
-        width: 12,
-        type:  'highway',
-      });
-    }
+    res.json(segments);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
   }
-
-  // ── Local roads N-S (skip positions that are already highways) ───────────
-  const hwSteps   = HW_SPACING / LOCAL_SPACING;
-  const firstLX   = Math.ceil(minX  / LOCAL_SPACING);
-  const lastLX    = Math.floor(maxX / LOCAL_SPACING);
-  for (let ix = firstLX; ix <= lastLX; ix++) {
-    if (ix % hwSteps === 0) continue; // this column is a highway
-    const firstSeg = Math.floor(minZ / LOCAL_SPACING);
-    const lastSeg  = Math.floor(maxZ / LOCAL_SPACING);
-    for (let iz = firstSeg; iz <= lastSeg; iz++) {
-      roads.push({
-        id:    segId('local', 'ns', ix, iz),
-        x1:    ix * LOCAL_SPACING,
-        z1:    iz * LOCAL_SPACING,
-        x2:    ix * LOCAL_SPACING,
-        z2:    (iz + 1) * LOCAL_SPACING,
-        width: 5,
-        type:  'local',
-      });
-    }
-  }
-
-  // ── Local roads E-W (skip positions that are already highways) ───────────
-  const firstLZ = Math.ceil(minZ  / LOCAL_SPACING);
-  const lastLZ  = Math.floor(maxZ / LOCAL_SPACING);
-  for (let iz = firstLZ; iz <= lastLZ; iz++) {
-    if (iz % hwSteps === 0) continue; // this row is a highway
-    const firstSeg = Math.floor(minX / LOCAL_SPACING);
-    const lastSeg  = Math.floor(maxX / LOCAL_SPACING);
-    for (let ix = firstSeg; ix <= lastSeg; ix++) {
-      roads.push({
-        id:    segId('local', 'ew', iz, ix),
-        x1:    ix * LOCAL_SPACING,
-        z1:    iz * LOCAL_SPACING,
-        x2:    (ix + 1) * LOCAL_SPACING,
-        z2:    iz * LOCAL_SPACING,
-        width: 5,
-        type:  'local',
-      });
-    }
-  }
-
-  res.json(roads);
 };

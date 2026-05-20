@@ -16,14 +16,19 @@ interface GameStructure {
   height: number;
 }
 
+interface ShapePoint { dx: number; dz: number; }
+interface Waypoint   { x:  number; z:  number; }
+
 interface GameHydrography {
-  id:    number;
-  name:  string;
-  type:  'lake' | 'river';
-  x:     number;
-  z:     number;
-  width: number;
-  depth: number;
+  id:          number;
+  name:        string;
+  type:        'lake' | 'river' | 'ocean';
+  x:           number;
+  z:           number;
+  width:       number;
+  depth:       number;
+  shapePoints: ShapePoint[] | null;  // polygon vertices for lakes
+  waypoints:   Waypoint[]   | null;  // path points for rivers
 }
 
 interface GameWeather {
@@ -49,7 +54,7 @@ interface TerrainTile {
   size:        number;
   resolution:  number;
   heights:     number[];
-  groundCover: 'grassland' | 'forest' | 'farmland' | 'arid';
+  groundCover: 'grassland' | 'forest' | 'farmland' | 'arid' | 'ocean' | 'alpine';
   trees:       TerrainTree[];
 }
 
@@ -84,10 +89,12 @@ interface GameAirport {
 }
 
 interface GameTown {
-  id:   number;
-  name: string;
-  x:    number;
-  z:    number;
+  id:         number;
+  name:       string;
+  x:          number;
+  z:          number;
+  size:       'city' | 'town' | 'village' | 'hamlet';
+  population: number;
 }
 
 interface PlanePart {
@@ -142,6 +149,7 @@ import {
   Scene,
   Color3,
   Color4,
+  Vector2,
   Vector3,
   HemisphericLight,
   DirectionalLight,
@@ -159,7 +167,9 @@ import {
   PointerEventTypes,
   VertexData,
   TransformNode,
+  Texture,
 } from '@babylonjs/core';
+import { WaterMaterial } from '@babylonjs/materials';
 
 interface DebrisPiece {
   mesh:            Mesh;
@@ -254,6 +264,14 @@ interface OtherPlayer {
         </div>
       </div>
       <canvas #minimapCanvas width="210" height="210" class="minimap"></canvas>
+
+      <!-- Large world map overlay -->
+      <div class="map-overlay" *ngIf="showMap" (click)="showMap = false">
+        <div class="map-container" (click)="$event.stopPropagation()">
+          <canvas #mapCanvas width="860" height="860" class="map-canvas"></canvas>
+          <div class="map-footer">Press M or ESC to close</div>
+        </div>
+      </div>
     </div>
   `,
   styles: [`
@@ -471,11 +489,38 @@ interface OtherPlayer {
       z-index: 4;
       box-shadow: 0 2px 16px rgba(0,0,0,0.55);
     }
+    .map-overlay {
+      position: absolute;
+      inset: 0;
+      background: rgba(0,0,0,0.72);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 50;
+    }
+    .map-container {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+    }
+    .map-canvas {
+      display: block;
+      border: 1px solid rgba(255,255,255,0.28);
+      box-shadow: 0 4px 32px rgba(0,0,0,0.7);
+    }
+    .map-footer {
+      color: rgba(255,255,255,0.45);
+      font-family: monospace;
+      font-size: 11px;
+      letter-spacing: 0.04em;
+    }
   `]
 })
 export class GameComponent implements OnInit, OnDestroy {
   @ViewChild('gameCanvas',  { static: true }) canvasRef!:        ElementRef<HTMLCanvasElement>;
   @ViewChild('minimapCanvas', { static: true }) minimapCanvasRef!: ElementRef<HTMLCanvasElement>;
+  @ViewChild('mapCanvas',   { static: false }) mapCanvasRef?: ElementRef<HTMLCanvasElement>;
 
   private engine!: Engine;
   private scene!: Scene;
@@ -491,14 +536,15 @@ export class GameComponent implements OnInit, OnDestroy {
   private towerMat!: StandardMaterial;
   private hangarMat!: StandardMaterial;
   /** How far around the player (X/Z) to request structures */
-  private readonly FETCH_RADIUS    = 3200;
+  private readonly FETCH_RADIUS    = 10000;
   /** Re-fetch after the player moves this far from the last fetch point */
-  private readonly REFETCH_DIST    = 1000;
+  private readonly REFETCH_DIST    = 2000;
 
   // ── Hydrography ──────────────────────────────────────────────────────
   private hydroMeshes      = new Map<number, Mesh>();
   private isFetchingHydro  = false;
-  private waterMat!: StandardMaterial;
+  private waterMat!: WaterMaterial;
+  private waterRenderMeshes = new Set<Mesh>();  // non-water meshes reflected by waterMat
 
   // ── Terrain ──────────────────────────────────────────────────────────────
   private terrainMeshes        = new Map<string, Mesh>();
@@ -510,9 +556,12 @@ export class GameComponent implements OnInit, OnDestroy {
   private forestMat!:          StandardMaterial;
   private farmMat!:            StandardMaterial;
   private aridMat!:            StandardMaterial;
+  private oceanMat!:           StandardMaterial;
+  private alpineMat!:          StandardMaterial;
+  private terrainVCMat!:       StandardMaterial;  // vertex-color material for all terrain
   private treeMat!:            StandardMaterial;
-  private readonly TERRAIN_FETCH_RADIUS = 6400;
-  private readonly TERRAIN_REFETCH_DIST = 2000;
+  private readonly TERRAIN_FETCH_RADIUS = 20000;
+  private readonly TERRAIN_REFETCH_DIST = 4000;
 
   // ── Roads ─────────────────────────────────────────────────────────────────
   private roadMeshes           = new Map<string, Mesh>();
@@ -520,8 +569,8 @@ export class GameComponent implements OnInit, OnDestroy {
   private lastRoadFetchPos:    Vector3 | null = null;
   private highwayMat!:         StandardMaterial;
   private localRoadMat!:       StandardMaterial;
-  private readonly ROAD_FETCH_RADIUS  = 3200;
-  private readonly ROAD_REFETCH_DIST  = 1000;
+  private readonly ROAD_FETCH_RADIUS  = 10000;
+  private readonly ROAD_REFETCH_DIST  = 2000;
 
   // ── Airports ───────────────────────────────────────────────────────────────
   private airports: GameAirport[] = [];
@@ -603,6 +652,11 @@ export class GameComponent implements OnInit, OnDestroy {
   crashMessage     = '';
   crashBoxVisible  = false;
   stalling         = false;
+  showMap          = false;
+
+  private mapOverview: { worldX: number; worldZ: number; groundCover: string }[] | null = null;
+  private mapFetching  = false;
+  private mapRafId: number | null = null;
 
   private INITIAL_SPEED    = 0;    // ground start — zero speed on runway
   private INITIAL_THROTTLE = 0.0;  // player must throttle up to take off
@@ -622,6 +676,89 @@ export class GameComponent implements OnInit, OnDestroy {
   private STALL_SPEED  = 125;      // minimum safe airspeed (below this → stall warning on HUD)
   private WEIGHT       = 1.0;      // per-plane gravity/lift multiplier (1 = Cessna baseline)
   private GROUND_OFFSET = 1.60;    // plane-center height above ground surface (Cessna default)
+
+  // ── Spherical world ───────────────────────────────────────────────────────
+  // The planet center sits at (0, -WORLD_RADIUS, 0).  The spawn origin (0,0,0)
+  // lies exactly on the sphere surface, so near-origin behaviour is unchanged.
+  // All world objects (terrain, roads, airports, water) store flat (x,z)
+  // coordinates; the frontend projects them onto the sphere using sphereSurfaceY.
+  private readonly WORLD_RADIUS = 600_000;
+
+  /** Parabolic approximation of the sphere surface height at (x,z).
+   *  Exact: sqrt(R² − x² − z²) − R.  Approx valid for |x|,|z| << R. */
+  private sphereSurfaceY(x: number, z: number): number {
+    return -(x * x + z * z) / (2 * this.WORLD_RADIUS);
+  }
+
+  /** Unit vector pointing away from the planet center at position (x, y, z). */
+  private localUpAt(x: number, y: number, z: number): Vector3 {
+    return new Vector3(x, y + this.WORLD_RADIUS, z).normalize();
+  }
+
+  /**
+   * Maps a terrain vertex height (and tile biome hint) to an RGB colour.
+   * Used for per-vertex colour blending so coastlines follow the actual
+   * heightfield contour rather than rectangular tile edges.
+   *
+   * Ocean-blue is ONLY used when cover === 'ocean'.  Non-ocean tiles (flat
+   * plains, airports, spawn area) never receive water colour even when their
+   * height is 0, which prevents the central airport from looking submerged.
+   * Actual ocean tiles are always entirely h=0 so their cover tag is the
+   * reliable discriminator between "ocean" and "flat dry land".
+   */
+  private terrainVertexColor(h: number, cover: string): [number, number, number] {
+    const lerp = (a: number, b: number, t: number) =>
+      a + (b - a) * Math.min(1, Math.max(0, t));
+
+    // True ocean tiles (server-classified): always deep-water blue
+    if (cover === 'ocean') return [0.04, 0.18, 0.48];
+
+    // ── All non-ocean tiles ──────────────────────────────────────────────────
+    // Beach / low coastal (0 → 8): sandy-tan at h=0, transitions to land colour.
+    // Flat areas (airports, plains) with h=0 show dry sandy ground, not water.
+    if (h < 8) {
+      const t = h / 8;
+      if (cover === 'arid')
+        return [lerp(0.82, 0.75, t), lerp(0.76, 0.58, t), lerp(0.52, 0.30, t)];
+      // grassland / forest / farmland / coastal
+      return [lerp(0.80, 0.44, t), lerp(0.76, 0.68, t), lerp(0.46, 0.24, t)];
+    }
+
+    // Low terrain (8 → 60)
+    if (h < 60) {
+      const t = (h - 8) / 52;
+      if (cover === 'arid')
+        return [lerp(0.75, 0.60, t), lerp(0.58, 0.46, t), lerp(0.30, 0.22, t)];
+      if (cover === 'farmland')
+        return [lerp(0.55, 0.48, t), lerp(0.72, 0.65, t), lerp(0.28, 0.20, t)];
+      return [lerp(0.34, 0.26, t), lerp(0.62, 0.52, t), lerp(0.22, 0.18, t)];
+    }
+
+    // Mid slopes (60 → 220)
+    if (h < 220) {
+      const t = (h - 60) / 160;
+      if (cover === 'arid')
+        return [lerp(0.60, 0.52, t), lerp(0.46, 0.40, t), lerp(0.22, 0.28, t)];
+      if (cover === 'farmland')
+        return [lerp(0.48, 0.42, t), lerp(0.65, 0.52, t), lerp(0.20, 0.28, t)];
+      return [lerp(0.26, 0.36, t), lerp(0.52, 0.44, t), lerp(0.18, 0.30, t)];
+    }
+
+    // Upper slopes / rocky (220 → 420)
+    if (h < 420) {
+      const t = (h - 220) / 200;
+      return [lerp(0.44, 0.58, t), lerp(0.46, 0.54, t), lerp(0.34, 0.46, t)];
+    }
+
+    // Alpine rocky (420 → 640)
+    if (h < 640) {
+      const t = (h - 420) / 220;
+      return [lerp(0.58, 0.82, t), lerp(0.54, 0.82, t), lerp(0.46, 0.84, t)];
+    }
+
+    // Snow cap (640+)
+    return [0.94, 0.96, 0.99];
+  }
 
   // World-space velocity vector — replaces the scalar speed + physicsVY decomposition.
   // All aerodynamic forces (thrust, drag, lift, gravity) act on this vector directly,
@@ -714,6 +851,15 @@ export class GameComponent implements OnInit, OnDestroy {
       if (e.key === 'Escape' && this.bombBayOpen) {
         this.ngZone.run(() => { this.bombBayOpen = false; });
       }
+      if (e.key === 'm' || e.key === 'M') {
+        this.ngZone.run(() => {
+          this.showMap = !this.showMap;
+          if (this.showMap) this.openLargeMap();
+        });
+      }
+      if (e.key === 'Escape' && this.showMap) {
+        this.ngZone.run(() => { this.showMap = false; });
+      }
       if ((e.key === 'g' || e.key === 'G') && this.retractableGear) {
         this.ngZone.run(() => {
           this.gearDown        = !this.gearDown;
@@ -793,7 +939,7 @@ export class GameComponent implements OnInit, OnDestroy {
     }, scene);
     this.planeMesh.isVisible = false;
     // Spawn at south end of XCTR-18 (heading 0, length 2000, center z=0)
-    this.planeMesh.position  = new Vector3(0, 1.60, -900);
+    this.planeMesh.position  = new Vector3(0, 1.60, 300);
 
     const storedSlug = localStorage.getItem('selectedPlane');
     if (storedSlug) this.selectedPlaneSlug = storedSlug;
@@ -810,6 +956,7 @@ export class GameComponent implements OnInit, OnDestroy {
     this.orbitCamera.upperRadiusLimit = 200;
     this.orbitCamera.lowerBetaLimit   = 0.05;          // prevent flipping overhead
     this.orbitCamera.upperBetaLimit   = Math.PI / 2.1; // stop going below horizon
+    this.orbitCamera.maxZ             = 120000;        // far clip covers full loaded tile range
     this.orbitCamera.attachControl(this.canvasRef.nativeElement, true); // enable mouse drag
     this.orbitCamera.layerMask = 0x0FFFFFFF | 0x10000000; // sees default + plane layer
 
@@ -820,6 +967,7 @@ export class GameComponent implements OnInit, OnDestroy {
     this.cockpitCamera = new FreeCamera('cockpitCam', new Vector3(0, 0.44, 3.2), scene);
     this.cockpitCamera.parent    = this.planeMesh;
     this.cockpitCamera.minZ      = 0.1;  // tight near-clip so close terrain/buildings don't vanish
+    this.cockpitCamera.maxZ      = 120000;
     this.cockpitCamera.fov       = 1.1;  // ~63° vertical — wide cockpit view so panel fits in frame
     // Cockpit layer 0x20000000 contains interior geometry; orbit camera mask
     // (0x1FFFFFFF) does NOT overlap with 0x20000000 so interior stays invisible
@@ -851,12 +999,21 @@ export class GameComponent implements OnInit, OnDestroy {
     this.hangarMat = new StandardMaterial('hangarMat', scene);
     this.hangarMat.diffuseTexture = this.createHangarTexture(scene);
 
-    // ── Water material (shared by all hydrography features) ──────────────
-    this.waterMat = new StandardMaterial('waterMat', scene);
-    this.waterMat.diffuseColor  = new Color3(0.10, 0.38, 0.72);
-    this.waterMat.specularColor = new Color3(0.85, 0.92, 1.00);
-    this.waterMat.specularPower = 64;
-    this.waterMat.alpha         = 0.78;
+    // ── Procedural water material (BabylonJS WaterMaterial) ─────────────────
+    // Uses reflection + refraction render targets and an animated normal-map
+    // to produce realistic animated waves on lakes, rivers, and ocean tiles.
+    this.waterMat = new WaterMaterial('waterMat', scene, new Vector2(512, 512));
+    this.waterMat.bumpTexture    = new Texture(
+      'https://assets.babylonjs.com/textures/waterbump.png', scene);
+    this.waterMat.windForce      = -12;
+    this.waterMat.waveHeight     = 0.4;
+    this.waterMat.windDirection  = new Vector2(1.0, 0.6);
+    this.waterMat.waterColor     = new Color3(0.08, 0.30, 0.62);
+    this.waterMat.colorBlendFactor = 0.18;
+    this.waterMat.waveLength     = 0.08;
+    this.waterMat.waveSpeed      = 1.4;
+    // Sun sphere and sky in the reflection so water mirrors the sky
+    this.waterMat.addToRenderList(sunSphere);
 
     // ── Terrain biome materials ──────────────────────────────────────────────
     this.forestMat = new StandardMaterial('forestMat', scene);
@@ -873,6 +1030,27 @@ export class GameComponent implements OnInit, OnDestroy {
     this.aridMat.diffuseTexture = this.createAridTexture(scene);
     (this.aridMat.diffuseTexture as DynamicTexture).uScale = 24;
     (this.aridMat.diffuseTexture as DynamicTexture).vScale = 24;
+
+    // ── Ocean material (deep open-water tiles) ───────────────────────────
+    this.oceanMat = new StandardMaterial('oceanMat', scene);
+    this.oceanMat.diffuseColor  = new Color3(0.04, 0.22, 0.52);
+    this.oceanMat.specularColor = new Color3(0.70, 0.88, 1.00);
+    this.oceanMat.specularPower = 96;
+    this.oceanMat.alpha         = 0.92;
+
+    // ── Alpine material (rocky peaks above the treeline) ─────────────────
+    this.alpineMat = new StandardMaterial('alpineMat', scene);
+    this.alpineMat.diffuseColor  = new Color3(0.62, 0.58, 0.55);
+    this.alpineMat.specularColor = new Color3(0.30, 0.30, 0.32);
+    this.alpineMat.specularPower = 18;
+
+    // ── Vertex-colour terrain material (all terrain tiles share this) ─────
+    // Per-vertex RGBA encodes biome blending; diffuseColor=white passes
+    // vertex colours through unchanged so the gradient is exact.
+    this.terrainVCMat = new StandardMaterial('terrainVCMat', scene);
+    this.terrainVCMat.diffuseColor  = new Color3(1, 1, 1);
+    this.terrainVCMat.specularColor = new Color3(0.08, 0.08, 0.08);
+    this.terrainVCMat.specularPower = 28;
 
     // ── Tree material (shared by all procedural tree cones) ──────────────
     this.treeMat = new StandardMaterial('treeMat', scene);
@@ -1032,6 +1210,22 @@ export class GameComponent implements OnInit, OnDestroy {
     if (Math.abs(this.rotVelocity.y) > 0.0001)
       this.planeMesh.rotate(Axis.Y, this.rotVelocity.y * dt, Space.LOCAL);
 
+    // Spherical curvature correction — gently aligns the plane belly with local
+    // gravity so that level flight follows the sphere without pilot correction.
+    // The gain is very low; it is imperceptible during normal maneuvering.
+    if (!this.landed) {
+      const { x, y, z } = this.planeMesh.position;
+      const localGrav = this.localUpAt(x, y, z).negate();
+      const planeDown = this.planeMesh.getDirection(Axis.Y).negate();
+      const corrAxis  = Vector3.Cross(planeDown, localGrav);
+      const corrMag   = corrAxis.length();
+      if (corrMag > 0.0001) {
+        const localPitchAxis = this.planeMesh.getDirection(Axis.X);
+        const pitchErr = Vector3.Dot(corrAxis.scale(1 / corrMag), localPitchAxis) * corrMag;
+        this.rotVelocity.x += pitchErr * 0.08 * dt;
+      }
+    }
+
     // Throttle — Shift ramps up, Control ramps down; setting persists between frames
     if (this.keys.has('Shift')) {
       this.throttle = Math.min(1, this.throttle + this.THROTTLE_RATE * dt);
@@ -1103,9 +1297,9 @@ export class GameComponent implements OnInit, OnDestroy {
       this.velocity = fwd.scale(groundSpeed);
 
       this.planeMesh.position.addInPlace(this.velocity.scale(dt));
-      const groundY = Math.max(
-        this.getTerrainHeightAt(this.planeMesh.position.x, this.planeMesh.position.z), 0);
-      this.planeMesh.position.y = groundY + this.GROUND_OFFSET;
+      const { x: gx, z: gz } = this.planeMesh.position;
+      const groundY = Math.max(this.getTerrainHeightAt(gx, gz), 0);
+      this.planeMesh.position.y = groundY + this.sphereSurfaceY(gx, gz) + this.GROUND_OFFSET;
 
       // Auto-liftoff: as soon as lift force exceeds weight, break ground contact.
       if (this.LIFT_K * this.WEIGHT * groundSpeed * groundSpeed > this.GRAVITY * this.WEIGHT) {
@@ -1119,8 +1313,13 @@ export class GameComponent implements OnInit, OnDestroy {
       this.velocity.addInPlace(fwd.scale(this.ACCELERATION * this.throttle * dt));
       // 2. Drag — opposing velocity, linear in airspeed (preserves existing tuning)
       this.velocity.addInPlace(velNorm.scale(-this.DRAG_K * speed * dt));
-      // 3. Gravity — world -Y always pulling the aircraft down
-      this.velocity.y -= this.GRAVITY * this.WEIGHT * dt;
+      // 3. Gravity — pulls toward planet center (spherical world)
+      const gravDir = this.localUpAt(
+        this.planeMesh.position.x,
+        this.planeMesh.position.y,
+        this.planeMesh.position.z,
+      ).negate();
+      this.velocity.addInPlace(gravDir.scale(this.GRAVITY * this.WEIGHT * dt));
       // 4. Lift — perpendicular to velocity, scaled by AoA-dependent CL
       const liftAccel = this.LIFT_K * CL * speed * speed;
       this.velocity.addInPlace(liftDir.scale(liftAccel * dt));
@@ -1172,8 +1371,9 @@ export class GameComponent implements OnInit, OnDestroy {
     // Keep orbit camera centred on the plane
     this.orbitCamera.target.copyFrom(this.planeMesh.position);
 
-    // Altimeter — height above ground (y=0)
-    this.altitude = Math.max(0, this.planeMesh.position.y);
+    // Altimeter — height above sphere surface at current (x, z)
+    const { x: ax, y: ay, z: az } = this.planeMesh.position;
+    this.altitude = Math.max(0, ay - this.sphereSurfaceY(ax, az));
 
     // ── Stall ────────────────────────────────────────────────────────────────
     // Stall when AoA exceeds the critical angle OR airspeed falls below stall speed.
@@ -1216,8 +1416,9 @@ export class GameComponent implements OnInit, OnDestroy {
 
     // ── Crash detection (skipped while taxiing on the ground) ────────────────
     if (!this.landed) {
-      const terrainH = this.getTerrainHeightAt(this.planeMesh.position.x, this.planeMesh.position.z);
-      if (this.planeMesh.position.y < terrainH + 0.5) {
+      const { x: cx, y: cy, z: cz } = this.planeMesh.position;
+      const terrainH = this.getTerrainHeightAt(cx, cz);
+      if (cy < terrainH + this.sphereSurfaceY(cx, cz) + 0.5) {
         this.handleCrash('You hit the ground!');
         return;
       }
@@ -1319,8 +1520,9 @@ export class GameComponent implements OnInit, OnDestroy {
           height: s.height,
           depth:  s.depth,
         }, this.scene);
-        // Position so the base sits on the ground (Y = 0)
-        mesh.position = new Vector3(s.x, s.height / 2, s.z);
+        // Base sits on terrain surface; fall back to sphere drop if tile not yet loaded
+        const terrH = this.getTerrainHeightAt(s.x, s.z);
+        mesh.position = new Vector3(s.x, terrH + this.sphereSurfaceY(s.x, s.z) + s.height / 2, s.z);
         mesh.material = s.type === 'tower'  ? this.towerMat
                       : s.type === 'hangar' ? this.hangarMat
                       :                       this.buildingMat;
@@ -1355,17 +1557,63 @@ export class GameComponent implements OnInit, OnDestroy {
     for (const h of features) {
       if (this.hydroMeshes.has(h.id)) continue;
 
-      // CreateGround: width = X axis, height param = Z axis
-      const mesh = MeshBuilder.CreateGround(`hydro-${h.id}`, {
-        width:       h.width,
-        height:      h.depth,
-        subdivisions: 1,
-      }, this.scene);
-      // Sit just above the terrain to avoid z-fighting
-      mesh.position    = new Vector3(h.x, 0.05, h.z);
-      mesh.material    = this.waterMat;
-      mesh.isPickable  = false;
-      this.hydroMeshes.set(h.id, mesh);
+      if (h.type === 'river' && h.waypoints && h.waypoints.length >= 2) {
+        // Render as connected box segments along waypoints
+        const segs: Mesh[] = [];
+        for (let i = 0; i < h.waypoints.length - 1; i++) {
+          const a = h.waypoints[i], b = h.waypoints[i + 1];
+          const dx = b.x - a.x, dz = b.z - a.z;
+          const len = Math.sqrt(dx * dx + dz * dz);
+          if (len < 0.01) continue;
+          const midX = (a.x + b.x) / 2, midZ = (a.z + b.z) / 2;
+          const seg = MeshBuilder.CreateBox(`river-${h.id}-${i}`, {
+            width: len, height: 0.15, depth: h.width,
+          }, this.scene);
+          seg.position   = new Vector3(midX, this.sphereSurfaceY(midX, midZ) + 0.05, midZ);
+          seg.rotation.y = -Math.atan2(dx, dz);
+          seg.material   = this.waterMat;
+          seg.isPickable = false;
+          segs.push(seg);
+        }
+        if (segs.length > 0) this.hydroMeshes.set(h.id, segs[0]);
+
+      } else if (h.shapePoints && h.shapePoints.length >= 3) {
+        // Render lake as polygon fan mesh
+        const surfaceY  = this.sphereSurfaceY(h.x, h.z) + 0.05;
+        const positions: number[] = [];
+        const indices:   number[] = [];
+        const normals:   number[] = [];
+        // Vertex 0 = center
+        positions.push(h.x, surfaceY, h.z);
+        for (const p of h.shapePoints) {
+          const vY = this.sphereSurfaceY(h.x + p.dx, h.z + p.dz) + 0.05;
+          positions.push(h.x + p.dx, vY, h.z + p.dz);
+        }
+        const N = h.shapePoints.length;
+        for (let i = 1; i <= N; i++) {
+          indices.push(0, i % N + 1, i);
+        }
+        VertexData.ComputeNormals(positions, indices, normals);
+        const vd = new VertexData();
+        vd.positions = positions;
+        vd.indices   = indices;
+        vd.normals   = normals;
+        const mesh = new Mesh(`hydro-${h.id}`, this.scene);
+        vd.applyToMesh(mesh, false);
+        mesh.material   = this.waterMat;
+        mesh.isPickable = false;
+        this.hydroMeshes.set(h.id, mesh);
+
+      } else {
+        // Fallback: flat rectangle
+        const mesh = MeshBuilder.CreateGround(`hydro-${h.id}`, {
+          width: h.width, height: h.depth, subdivisions: 1,
+        }, this.scene);
+        mesh.position   = new Vector3(h.x, this.sphereSurfaceY(h.x, h.z) + 0.05, h.z);
+        mesh.material   = this.waterMat;
+        mesh.isPickable = false;
+        this.hydroMeshes.set(h.id, mesh);
+      }
     }
   }
 
@@ -1398,6 +1646,10 @@ export class GameComponent implements OnInit, OnDestroy {
     // Dispose tiles that moved out of range
     for (const [id, mesh] of this.terrainMeshes) {
       if (!incomingIds.has(id)) {
+        if (this.waterRenderMeshes.has(mesh)) {
+          this.waterMat.removeFromRenderList(mesh);
+          this.waterRenderMeshes.delete(mesh);
+        }
         mesh.dispose();
         this.terrainMeshes.delete(id);
         this.terrainTileData.delete(id);
@@ -1417,13 +1669,27 @@ export class GameComponent implements OnInit, OnDestroy {
       const positions: number[] = [];
       const normals:   number[] = [];
       const uvs:       number[] = [];
+      const colors:    number[] = [];
       const indices:   number[] = [];
 
-      // Build vertex grid (row-major: row = Z, col = X — matches server ordering)
+      // Build vertex grid (row-major: row = Z, col = X — matches server ordering).
+      // Each vertex is displaced by the sphere drop at its world (x, z) position
+      // so terrain follows the planet curvature.  VertexData.ComputeNormals then
+      // produces correctly tilted normals automatically.
+      // Per-vertex RGBA colours are computed from actual height so biome blending
+      // and coastlines follow the heightfield contour rather than tile edges.
       for (let row = 0; row < N; row++) {
         for (let col = 0; col < N; col++) {
-          positions.push(-S / 2 + col * step, tile.heights[row * N + col], -S / 2 + row * step);
+          const localX  = -S / 2 + col * step;
+          const localZ  = -S / 2 + row * step;
+          const worldVX = tile.worldX + S / 2 + localX;
+          const worldVZ = tile.worldZ + S / 2 + localZ;
+          const h       = tile.heights[row * N + col];
+          const drop    = this.sphereSurfaceY(worldVX, worldVZ);
+          positions.push(localX, h + drop, localZ);
           uvs.push(col / (N - 1), row / (N - 1));
+          const [r, g, b] = this.terrainVertexColor(h, tile.groundCover);
+          colors.push(r, g, b, 1.0);
         }
       }
       for (let row = 0; row < N - 1; row++) {
@@ -1439,15 +1705,23 @@ export class GameComponent implements OnInit, OnDestroy {
       vd.indices    = indices;
       vd.normals    = normals;
       vd.uvs        = uvs;
+      vd.colors     = colors;
 
       const mesh       = new Mesh(`terrain-${tile.id}`, this.scene);
       vd.applyToMesh(mesh, false);
       mesh.position    = new Vector3(tile.worldX + S / 2, 0, tile.worldZ + S / 2);
       mesh.isPickable  = false;
-      mesh.material    = tile.groundCover === 'forest'   ? this.forestMat
-                       : tile.groundCover === 'farmland' ? this.farmMat
-                       : tile.groundCover === 'arid'     ? this.aridMat
-                       :                                   this.grasslandMat;
+
+      if (tile.groundCover === 'ocean') {
+        // Ocean tiles use the animated WaterMaterial — don't add to its own render list
+        mesh.material = this.waterMat;
+      } else {
+        // Land tiles use vertex colours and feed the water reflection render target
+        mesh.material = this.terrainVCMat;
+        this.waterMat.addToRenderList(mesh);
+        this.waterRenderMeshes.add(mesh);
+      }
+
       this.terrainMeshes.set(tile.id, mesh);
       this.terrainTileData.set(tile.id, tile);
 
@@ -1463,7 +1737,7 @@ export class GameComponent implements OnInit, OnDestroy {
             diameterBottom: 4.5 * tree.scale,
             tessellation:   6,
           }, this.scene);
-          cone.position   = new Vector3(tree.x, h + coneH / 2, tree.z);
+          cone.position   = new Vector3(tree.x, h + this.sphereSurfaceY(tree.x, tree.z) + coneH / 2, tree.z);
           cone.material   = this.treeMat;
           cone.isPickable = false;
           tileTrees.push(cone);
@@ -1534,11 +1808,9 @@ export class GameComponent implements OnInit, OnDestroy {
         depth:  isNS ? length     : road.width,
       }, this.scene);
 
-      mesh.position   = new Vector3(
-        isNS ? road.x1 : (road.x1 + road.x2) / 2,
-        0.15,
-        isNS ? (road.z1 + road.z2) / 2 : road.z1,
-      );
+      const rMidX = isNS ? road.x1 : (road.x1 + road.x2) / 2;
+      const rMidZ = isNS ? (road.z1 + road.z2) / 2 : road.z1;
+      mesh.position   = new Vector3(rMidX, this.sphereSurfaceY(rMidX, rMidZ) + 0.15, rMidZ);
       mesh.material   = road.type === 'highway' ? this.highwayMat : this.localRoadMat;
       mesh.isPickable = false;
       this.roadMeshes.set(road.id, mesh);
@@ -1564,7 +1836,7 @@ export class GameComponent implements OnInit, OnDestroy {
       const meshes: Mesh[] = [];
       // Beacon sphere visible from the air
       const beacon = MeshBuilder.CreateSphere(`beacon-${airport.id}`, { diameter: 8, segments: 8 }, this.scene);
-      beacon.position = new Vector3(airport.x, airport.elevation + 20, airport.z);
+      beacon.position = new Vector3(airport.x, airport.elevation + this.sphereSurfaceY(airport.x, airport.z) + 20, airport.z);
       beacon.material = this.airportBeaconMat;
       beacon.isPickable = false;
       meshes.push(beacon);
@@ -1577,7 +1849,7 @@ export class GameComponent implements OnInit, OnDestroy {
         const surface = MeshBuilder.CreateGround(`rwy-${rw.id}`, {
           width: rw.width, height: rw.length, subdivisions: 1,
         }, this.scene);
-        surface.position = new Vector3(rw.x, rw.elevation + 0.2, rw.z);
+        surface.position = new Vector3(rw.x, rw.elevation + this.sphereSurfaceY(rw.x, rw.z) + 0.2, rw.z);
         surface.rotation.y = -rad;
         const rwMat = new StandardMaterial(`rwMat-${rw.id}`, this.scene);
         rwMat.diffuseTexture = this.createRunwayTexture(this.scene);
@@ -1592,7 +1864,7 @@ export class GameComponent implements OnInit, OnDestroy {
           const bar = MeshBuilder.CreateBox(`thrsh-${rw.id}-${sign}`, {
             width: rw.width * 1.15, height: 0.4, depth: 5,
           }, this.scene);
-          bar.position = new Vector3(wx, rw.elevation + 0.35, wz);
+          bar.position = new Vector3(wx, rw.elevation + this.sphereSurfaceY(wx, wz) + 0.35, wz);
           bar.rotation.y = -rad;
           bar.material = this.runwayThresholdMat;
           bar.isPickable = false;
@@ -1614,7 +1886,8 @@ export class GameComponent implements OnInit, OnDestroy {
 
   private checkRunwayLanding(rw: GameRunway): boolean {
     const py = this.planeMesh.position.y;
-    if (py > rw.elevation + 8 || py < rw.elevation - 1) return false;
+    const rwSurface = rw.elevation + this.sphereSurfaceY(rw.x, rw.z);
+    if (py > rwSurface + 8 || py < rwSurface - 1) return false;
     if (!this.isOnRunway(rw)) return false;
     if (this.speed > 240) return false;
     if (this.velocity.y < -20) return false;
@@ -1626,7 +1899,10 @@ export class GameComponent implements OnInit, OnDestroy {
   private performLanding(airport: GameAirport): void {
     this.landed    = true;
     this.velocity.y = 0;
-    this.planeMesh.position.y = airport.elevation + this.GROUND_OFFSET;
+    const rw0 = airport.runways[0];
+    const landX = rw0?.x ?? airport.x;
+    const landZ = rw0?.z ?? airport.z;
+    this.planeMesh.position.y = airport.elevation + this.sphereSurfaceY(landX, landZ) + this.GROUND_OFFSET;
     // Auto-extend gear on touchdown so it is always down after landing
     if (this.retractableGear && !this.gearDown) {
       this.gearDown       = true;
@@ -1972,6 +2248,179 @@ export class GameComponent implements OnInit, OnDestroy {
       .catch(() => {});
   }
 
+  // ── Large world map ────────────────────────────────────────────────────────
+
+  private openLargeMap(): void {
+    // Give Angular one frame to insert the canvas into the DOM, then start the loop
+    const startLoop = () => setTimeout(() => this.startMapLoop(), 30);
+    if (this.mapOverview) { startLoop(); return; }
+    if (this.mapFetching) return;
+    this.mapFetching = true;
+    fetch(`${Settings.apiUrl}terrain/overview`)
+      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+      .then(data => { this.mapOverview = data; startLoop(); })
+      .catch(() => startLoop())
+      .finally(() => { this.mapFetching = false; });
+  }
+
+  private startMapLoop(): void {
+    if (this.mapRafId !== null) return;
+    const tick = () => {
+      if (!this.showMap) { this.mapRafId = null; return; }
+      this.drawLargeMap();
+      this.mapRafId = requestAnimationFrame(tick);
+    };
+    this.mapRafId = requestAnimationFrame(tick);
+  }
+
+  private drawLargeMap(): void {
+    const canvas = this.mapCanvasRef?.nativeElement;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const W = canvas.width;   // 860
+    const H = canvas.height;  // 860
+    const WORLD_RANGE = 70000;
+    const scale = W / (2 * WORLD_RANGE);
+    const TILE  = 4000;
+
+    // World → canvas: North (+Z) = up, East (+X) = right
+    const toMX = (wx: number) => W / 2 + wx * scale;
+    const toMY = (wz: number) => H / 2 - wz * scale;
+
+    // Background
+    ctx.fillStyle = '#06091a';
+    ctx.fillRect(0, 0, W, H);
+
+    // Subtle grid lines every 10 000 units
+    ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+    ctx.lineWidth   = 0.5;
+    for (let g = -70000; g <= 70000; g += 10000) {
+      ctx.beginPath(); ctx.moveTo(toMX(g), 0);  ctx.lineTo(toMX(g), H); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, toMY(g));  ctx.lineTo(W, toMY(g)); ctx.stroke();
+    }
+
+    // ── Terrain tiles ──────────────────────────────────────────────────────
+    if (this.mapOverview) {
+      const tileSize = TILE * scale;
+      const COLORS: Record<string, string> = {
+        ocean:     '#0b2e5e',
+        alpine:    '#8a8880',
+        forest:    '#27542a',
+        farmland:  '#7da035',
+        arid:      '#b08a42',
+        grassland: '#4e9832',
+        coastal:   '#6ba85a',
+      };
+      for (const t of this.mapOverview) {
+        ctx.fillStyle = COLORS[t.groundCover] ?? '#3a6030';
+        // worldZ is the south edge; north edge = worldZ + TILE_SIZE
+        ctx.fillRect(toMX(t.worldX), toMY(t.worldZ + TILE), tileSize + 0.6, tileSize + 0.6);
+      }
+    }
+
+    // ── Towns ──────────────────────────────────────────────────────────────
+    for (const town of this.towns) {
+      const mx = toMX(town.x), my = toMY(town.z);
+      if (mx < 0 || mx > W || my < 0 || my > H) continue;
+
+      const dotR = town.size === 'city'    ? 5.5
+                 : town.size === 'town'    ? 3.5
+                 : town.size === 'village' ? 2.5
+                 :                          1.5;
+
+      ctx.fillStyle = town.size === 'city' ? '#ffe580' : '#c8daff';
+      ctx.beginPath(); ctx.arc(mx, my, dotR, 0, Math.PI * 2); ctx.fill();
+
+      if (town.size === 'city' || town.size === 'town') {
+        ctx.font      = town.size === 'city' ? 'bold 11px monospace' : '9px monospace';
+        ctx.fillStyle = town.size === 'city' ? '#ffe580' : 'rgba(200,220,255,0.9)';
+        ctx.textAlign = 'left';
+        ctx.fillText(town.name, mx + dotR + 3, my + 4);
+      }
+    }
+
+    // ── Airports ───────────────────────────────────────────────────────────
+    for (const airport of this.airports) {
+      const mx = toMX(airport.x), my = toMY(airport.z);
+      if (mx < 0 || mx > W || my < 0 || my > H) continue;
+
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth   = 1.5;
+      ctx.strokeRect(mx - 4, my - 4, 8, 8);
+
+      // Inner cross representing runways
+      ctx.beginPath();
+      ctx.moveTo(mx - 4, my); ctx.lineTo(mx + 4, my);
+      ctx.moveTo(mx, my - 4); ctx.lineTo(mx, my + 4);
+      ctx.stroke();
+
+      ctx.font      = '8px monospace';
+      ctx.fillStyle = 'rgba(255,255,255,0.85)';
+      ctx.textAlign = 'center';
+      ctx.fillText(airport.code, mx, my - 7);
+    }
+
+    // ── Player position (red arrow) ────────────────────────────────────────
+    const px = this.planeMesh.position.x;
+    const pz = this.planeMesh.position.z;
+    const fwd     = this.planeMesh.getDirection(Axis.Z);
+    const heading = Math.atan2(fwd.x, fwd.z);
+
+    ctx.save();
+    ctx.translate(toMX(px), toMY(pz));
+    ctx.rotate(heading);
+    ctx.fillStyle = '#ff3030';
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 0.8;
+    ctx.beginPath();
+    ctx.moveTo(0, -9); ctx.lineTo(6, 7); ctx.lineTo(0, 4); ctx.lineTo(-6, 7);
+    ctx.closePath();
+    ctx.fill(); ctx.stroke();
+    ctx.restore();
+
+    // ── Scale bar (10 000 units) ───────────────────────────────────────────
+    const barLen = 10000 * scale;
+    const bx = W - barLen - 18, by = H - 18;
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth   = 2;
+    ctx.beginPath();
+    ctx.moveTo(bx, by); ctx.lineTo(bx, by - 5);
+    ctx.moveTo(bx, by); ctx.lineTo(bx + barLen, by);
+    ctx.moveTo(bx + barLen, by); ctx.lineTo(bx + barLen, by - 5);
+    ctx.stroke();
+    ctx.font      = '10px monospace';
+    ctx.fillStyle = 'rgba(255,255,255,0.75)';
+    ctx.textAlign = 'center';
+    ctx.fillText('10 000 u', bx + barLen / 2, by - 8);
+
+    // ── Biome legend ───────────────────────────────────────────────────────
+    const LEGEND: [string, string][] = [
+      ['Ocean',     '#0b2e5e'], ['Grassland', '#4e9832'],
+      ['Forest',    '#27542a'], ['Farmland',  '#7da035'],
+      ['Arid',      '#b08a42'], ['Alpine',    '#8a8880'],
+    ];
+    ctx.textAlign = 'left';
+    LEGEND.forEach(([label, color], i) => {
+      const lx = 14, ly = 20 + i * 17;
+      ctx.fillStyle = color;
+      ctx.fillRect(lx, ly, 13, 11);
+      ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+      ctx.lineWidth   = 0.5;
+      ctx.strokeRect(lx, ly, 13, 11);
+      ctx.fillStyle   = 'rgba(230,230,230,0.9)';
+      ctx.font        = '10px monospace';
+      ctx.fillText(label, lx + 17, ly + 9);
+    });
+
+    // ── Title ──────────────────────────────────────────────────────────────
+    ctx.font      = 'bold 14px monospace';
+    ctx.fillStyle = 'rgba(255,255,255,0.65)';
+    ctx.textAlign = 'center';
+    ctx.fillText('WORLD MAP', W / 2, 16);
+  }
+
   private updateMinimap(): void {
     const canvas = this.minimapCanvasRef.nativeElement;
     const ctx    = canvas.getContext('2d');
@@ -2024,15 +2473,23 @@ export class GameComponent implements OnInit, OnDestroy {
       const my = toMapY(town.z);
       if (mx < -20 || mx > size + 20 || my < -20 || my > size + 20) continue;
 
+      const dotR = town.size === 'city'    ? 6
+                 : town.size === 'town'    ? 4.5
+                 : town.size === 'village' ? 3
+                 :                          2;   // hamlet
+
       ctx.fillStyle = 'rgba(190, 210, 255, 0.9)';
       ctx.beginPath();
-      ctx.arc(mx, my, 3.5, 0, Math.PI * 2);
+      ctx.arc(mx, my, dotR, 0, Math.PI * 2);
       ctx.fill();
 
-      ctx.font = '9px monospace';
-      ctx.fillStyle = 'rgba(170, 195, 240, 0.85)';
-      ctx.textAlign = 'left';
-      ctx.fillText(town.name, mx + 6, my + 3);
+      // Only label cities, towns, and villages (skip hamlets to reduce clutter)
+      if (town.size !== 'hamlet') {
+        ctx.font = town.size === 'city' ? 'bold 10px monospace' : '9px monospace';
+        ctx.fillStyle = 'rgba(170, 195, 240, 0.85)';
+        ctx.textAlign = 'left';
+        ctx.fillText(town.name, mx + dotR + 3, my + 3);
+      }
     }
 
     // ── Airports — runways + code label ──
@@ -2560,7 +3017,7 @@ export class GameComponent implements OnInit, OnDestroy {
     this.smokeSystem?.stop(); this.smokeSystem?.dispose(); this.smokeSystem = null;
     this.crashBoxVisible = false;
 
-    this.planeMesh.position           = new Vector3(0, this.GROUND_OFFSET, -900);
+    this.planeMesh.position           = new Vector3(0, this.GROUND_OFFSET, 300);
     this.planeMesh.rotationQuaternion = Quaternion.Identity();
     this.speed        = 0;
     this.velocity.setAll(0);
@@ -2635,7 +3092,7 @@ export class GameComponent implements OnInit, OnDestroy {
     this.throttle = 0;
     this.crashed   = false;
     this.stalling  = false;
-    this.planeMesh.position = new Vector3(0, this.GROUND_OFFSET, -900);
+    this.planeMesh.position = new Vector3(0, this.GROUND_OFFSET, 300);
     this.planeMesh.rotationQuaternion = Quaternion.Identity();
     this.landed = true; this.landedAt = 'Central International Airport'; this.landingMsg = ''; this.landingMsgTimer = 0; this.liftoffGraceTimer = 0;
   }

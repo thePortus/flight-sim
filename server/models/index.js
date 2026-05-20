@@ -16,5 +16,13 @@ db.sequelize = sequelize;
 db.User        = require('./user.model')(sequelize, Sequelize.DataTypes);
 db.Structure   = require('./structure.model')(sequelize, Sequelize.DataTypes);
 db.Hydrography = require('./hydrography.model')(sequelize, Sequelize.DataTypes);
+db.Town        = require('./town.model')(sequelize, Sequelize.DataTypes);
+db.Airport     = require('./airport.model')(sequelize, Sequelize.DataTypes);
+db.Runway      = require('./runway.model')(sequelize, Sequelize.DataTypes);
+db.RoadPath    = require('./road_path.model')(sequelize, Sequelize.DataTypes);
+
+// Airport ↔ Runway association
+db.Airport.hasMany(db.Runway, { foreignKey: 'airportId', as: 'runways' });
+db.Runway.belongsTo(db.Airport, { foreignKey: 'airportId' });
 
 module.exports = db;
