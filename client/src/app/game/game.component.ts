@@ -169,7 +169,7 @@ import {
   TransformNode,
   Texture,
 } from '@babylonjs/core';
-import { WaterMaterial } from '@babylonjs/materials';
+import { WaterMaterial, SkyMaterial } from '@babylonjs/materials';
 
 interface DebrisPiece {
   mesh:            Mesh;
@@ -786,6 +786,14 @@ export class GameComponent implements OnInit, OnDestroy {
   private rainSystem:     ParticleSystem | null = null;
   private weatherRefreshId: number | null = null;
 
+  // ── Clouds & sky ─────────────────────────────────────────────────────────
+  private skyMat:               SkyMaterial | null = null;
+  private skyDome:              Mesh | null = null;
+  private cloudMeshes:          Mesh[] = [];
+  private cloudParticleSystems: ParticleSystem[] = [];
+  private cloudTextures:        DynamicTexture[] = [];
+  private lastCloudDescription  = '';
+
   // ── Plane (server-driven geometry) ───────────────────────────────────────
   private planeParts:   Mesh[] = [];
   private cockpitParts: Mesh[] = [];
@@ -893,13 +901,33 @@ export class GameComponent implements OnInit, OnDestroy {
   private buildScene(): Scene {
     const scene = new Scene(this.engine);
 
-    // Sky colour
+    // Sky colour — used as fallback for cockpit camera layer
     scene.clearColor = new Color4(0.22, 0.52, 0.90, 1);
 
     // Atmospheric fog — density is updated when weather arrives
     scene.fogMode    = Scene.FOGMODE_EXP2;
     scene.fogColor   = new Color3(0.38, 0.62, 0.88); // haze matches sky
     scene.fogDensity = 0.00008;                       // light default
+
+    // ── Procedural sky dome (Preetham atmospheric scattering) ────────────────
+    this.skyMat = new SkyMaterial('sky', scene);
+    this.skyMat.backFaceCulling  = false;
+    this.skyMat.turbidity        = 2.0;
+    this.skyMat.luminance        = 1.0;
+    this.skyMat.rayleigh         = 3.0;
+    this.skyMat.mieCoefficient   = 0.005;
+    this.skyMat.mieDirectionalG  = 0.98;
+    this.skyMat.useSunPosition   = true;
+    this.skyMat.sunPosition      = new Vector3(3000, 2200, 4000);
+    this.skyDome = MeshBuilder.CreateSphere(
+      'skyDome',
+      { diameter: 60000, segments: 8, sideOrientation: Mesh.BACKSIDE },
+      scene
+    );
+    this.skyDome.material         = this.skyMat;
+    this.skyDome.isPickable        = false;
+    this.skyDome.infiniteDistance  = true;
+    this.skyDome.layerMask         = 0x10000000; // exterior orbit camera only
 
     // Ambient light from above
     const light = new HemisphericLight('hemi', new Vector3(0, 1, 0), scene);
@@ -1110,6 +1138,9 @@ export class GameComponent implements OnInit, OnDestroy {
     this.rainSystem.color2          = new Color4(0.6, 0.75, 1.0, 0.4);
     this.rainSystem.colorDead       = new Color4(0.5, 0.70, 1.0, 0.0);
     // Do not start yet — fetchWeather will enable it if precipitation = 'rain'
+
+    // Initial cloud layers (rebuilt when first weather response arrives)
+    this.buildCloudSystem('Clear');
 
     // Initial structure load
     this.fetchStructures();
@@ -1401,6 +1432,9 @@ export class GameComponent implements OnInit, OnDestroy {
         this.velocity.y += (Math.random() - 0.5) * t * 4 * dt;
       }
     }
+
+    // ── Cloud drift ───────────────────────────────────────────────────────────
+    this.updateClouds(dt);
 
     // ── Landing detection (must run before crash check) ──────────────────────
     if (!this.landed) {
@@ -3426,6 +3460,11 @@ export class GameComponent implements OnInit, OnDestroy {
       .then(w => this.ngZone.run(() => {
         this.weather           = w;
         this.scene.fogDensity  = w.fog.density;
+        // Sky turbidity and fog colour vary with weather description
+        if (this.skyMat) this.skyMat.turbidity = this.skyTurbidityForDesc(w.description);
+        this.scene.fogColor = this.fogColorForDesc(w.description);
+        // Rebuild cloud layers only when description changes
+        this.buildCloudSystem(w.description);
         if (this.rainSystem) {
           if (w.precipitation === 'rain') this.rainSystem.start();
           else                            this.rainSystem.stop();
@@ -3639,6 +3678,201 @@ export class GameComponent implements OnInit, OnDestroy {
     return tex;
   }
 
+  // ────────────────────────────────────────────────────────────────────────
+  // Sky & Cloud system
+  // ────────────────────────────────────────────────────────────────────────
+
+  private skyTurbidityForDesc(description: string): number {
+    switch (description) {
+      case 'Clear':  return 2.0;
+      case 'Foggy':  return 4.5;
+      case 'Gusty':  return 2.5;
+      case 'Windy':  return 3.0;
+      case 'Stormy': return 8.0;
+      default:       return 2.0;
+    }
+  }
+
+  private fogColorForDesc(description: string): Color3 {
+    switch (description) {
+      case 'Clear':  return new Color3(0.38, 0.62, 0.88);
+      case 'Foggy':  return new Color3(0.60, 0.65, 0.70);
+      case 'Gusty':  return new Color3(0.40, 0.64, 0.85);
+      case 'Windy':  return new Color3(0.42, 0.62, 0.80);
+      case 'Stormy': return new Color3(0.35, 0.38, 0.42);
+      default:       return new Color3(0.38, 0.62, 0.88);
+    }
+  }
+
+  /** Generate a soft cloud puff texture using Canvas2D radial gradients. */
+  private buildCloudTexture(puffCount: number, grey: boolean): DynamicTexture {
+    const size = 512;
+    const dt   = new DynamicTexture('cldTex_' + Date.now(), { width: size, height: size }, this.scene, false);
+    const ctx  = dt.getContext() as CanvasRenderingContext2D;
+    ctx.clearRect(0, 0, size, size);
+    const brightness = grey ? 170 : 255;
+    for (let i = 0; i < puffCount; i++) {
+      const x = size * (0.15 + Math.random() * 0.70);
+      const y = size * (0.15 + Math.random() * 0.70);
+      const r = size * (0.10 + Math.random() * 0.18);
+      const grad = ctx.createRadialGradient(x, y, 0, x, y, r);
+      grad.addColorStop(0,   `rgba(${brightness},${brightness},${brightness},0.92)`);
+      grad.addColorStop(0.5, `rgba(${brightness},${brightness},${brightness},0.45)`);
+      grad.addColorStop(1,   'rgba(255,255,255,0)');
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    dt.update();
+    return dt;
+  }
+
+  /** Attach a cluster of large, slow particle puffs to a billboard for a volumetric halo. */
+  private buildCloudParticles(emitter: Mesh, cloudWidth: number, tex: DynamicTexture): ParticleSystem {
+    const ps = new ParticleSystem('cldPuff_' + emitter.name, 150, this.scene);
+    ps.particleTexture = tex;
+    ps.emitter         = emitter;
+    const half = cloudWidth * 0.30;
+    ps.minEmitBox  = new Vector3(-half, -cloudWidth * 0.08, -half);
+    ps.maxEmitBox  = new Vector3( half,  cloudWidth * 0.08,  half);
+    ps.color1      = new Color4(1.0, 1.0, 1.0, 0.30);
+    ps.color2      = new Color4(0.9, 0.9, 0.9, 0.20);
+    ps.colorDead   = new Color4(1.0, 1.0, 1.0, 0.00);
+    ps.minSize     = cloudWidth * 0.08;
+    ps.maxSize     = cloudWidth * 0.18;
+    ps.minLifeTime = 40;
+    ps.maxLifeTime = 80;
+    ps.emitRate    = 2;
+    ps.gravity     = Vector3.Zero();
+    ps.direction1  = new Vector3(-0.2, -0.05, -0.2);
+    ps.direction2  = new Vector3( 0.2,  0.05,  0.2);
+    ps.minEmitPower = 0;
+    ps.maxEmitPower = 0.05;
+    ps.blendMode    = ParticleSystem.BLENDMODE_STANDARD;
+    return ps;
+  }
+
+  /**
+   * Dispose and rebuild all cloud billboard layers to match a given weather description.
+   * Guards against redundant rebuilds when the description has not changed.
+   */
+  private buildCloudSystem(description: string): void {
+    if (description === this.lastCloudDescription) return;
+    this.lastCloudDescription = description;
+
+    // Dispose previous clouds
+    this.cloudParticleSystems.forEach(ps => ps.dispose());
+    this.cloudParticleSystems = [];
+    this.cloudMeshes.forEach(m  => m.dispose());
+    this.cloudMeshes = [];
+    this.cloudTextures.forEach(t => t.dispose());
+    this.cloudTextures = [];
+
+    interface CloudLayer {
+      count:        number;
+      altMin:       number;
+      altMax:       number;
+      width:        number;
+      height:       number;
+      grey:         boolean;
+      alpha:        number;
+      driftSpeed:   number;
+      puffCount:    number;
+      addParticles: boolean;
+    }
+
+    const configs: CloudLayer[] = (() => {
+      switch (description) {
+        case 'Clear':
+          return [
+            { count: 8,  altMin: 5000, altMax: 7000, width: 2200, height:  900, grey: false, alpha: 0.28, driftSpeed: 0.25, puffCount: 3,  addParticles: false },
+          ];
+        case 'Foggy':
+          return [
+            { count: 30, altMin:  200, altMax:  600, width: 3200, height: 1200, grey: true,  alpha: 0.72, driftSpeed: 0.40, puffCount: 8,  addParticles: false },
+            { count: 8,  altMin: 5000, altMax: 7000, width: 1600, height:  700, grey: true,  alpha: 0.30, driftSpeed: 0.20, puffCount: 3,  addParticles: false },
+          ];
+        case 'Gusty':
+          return [
+            { count: 16, altMin: 2000, altMax: 3500, width: 1600, height:  700, grey: false, alpha: 0.62, driftSpeed: 0.85, puffCount: 6,  addParticles: true  },
+            { count: 6,  altMin: 5000, altMax: 7000, width: 1900, height:  800, grey: false, alpha: 0.22, driftSpeed: 0.50, puffCount: 3,  addParticles: false },
+          ];
+        case 'Windy':
+          return [
+            { count: 22, altMin: 2000, altMax: 4000, width: 1900, height:  800, grey: false, alpha: 0.70, driftSpeed: 1.05, puffCount: 7,  addParticles: true  },
+            { count: 8,  altMin:  800, altMax: 1200, width: 2600, height: 1000, grey: false, alpha: 0.42, driftSpeed: 0.65, puffCount: 5,  addParticles: false },
+          ];
+        case 'Stormy':
+          return [
+            { count: 40, altMin:  400, altMax: 1200, width: 3600, height: 1400, grey: true,  alpha: 0.85, driftSpeed: 1.55, puffCount: 10, addParticles: true  },
+            { count: 12, altMin: 2000, altMax: 3500, width: 2600, height: 1100, grey: true,  alpha: 0.72, driftSpeed: 1.25, puffCount: 8,  addParticles: true  },
+          ];
+        default:
+          return [];
+      }
+    })();
+
+    for (const cfg of configs) {
+      // One texture and one material shared by all meshes in this layer
+      const tex = this.buildCloudTexture(cfg.puffCount, cfg.grey);
+      this.cloudTextures.push(tex);
+
+      const mat = new StandardMaterial(`cldMat_${description}_${cfg.altMin}`, this.scene);
+      mat.diffuseTexture = tex;
+      (mat.diffuseTexture as DynamicTexture).hasAlpha = true;
+      mat.useAlphaFromDiffuseTexture = true;
+      mat.emissiveColor   = new Color3(1, 1, 1);
+      mat.disableLighting = true;
+      mat.backFaceCulling = false;
+
+      for (let i = 0; i < cfg.count; i++) {
+        const name  = `cloud_${description}_${cfg.altMin}_${i}`;
+        const cloud = MeshBuilder.CreatePlane(name, { width: cfg.width, height: cfg.height }, this.scene);
+        cloud.billboardMode = Mesh.BILLBOARDMODE_ALL;
+        cloud.material      = mat;
+        cloud.isPickable    = false;
+        cloud.layerMask     = 0x10000000; // exterior view only
+
+        const angle = Math.random() * Math.PI * 2;
+        const dist  = 3000 + Math.random() * 12000;
+        cloud.position = new Vector3(
+          Math.cos(angle) * dist,
+          cfg.altMin + Math.random() * (cfg.altMax - cfg.altMin),
+          Math.sin(angle) * dist
+        );
+        cloud.visibility = cfg.alpha;
+        (cloud as any)._cloudDriftSpeed = cfg.driftSpeed;
+        this.cloudMeshes.push(cloud);
+
+        if (cfg.addParticles) {
+          const ps = this.buildCloudParticles(cloud, cfg.width, tex);
+          this.cloudParticleSystems.push(ps);
+          ps.start();
+        }
+      }
+    }
+  }
+
+  /** Drift cloud meshes with the current wind each frame; wrap when they stray too far. */
+  private updateClouds(dt: number): void {
+    if (!this.weather || this.cloudMeshes.length === 0) return;
+    const { x: wx, z: wz } = this.weather.wind;
+    const px = this.planeMesh?.position.x ?? 0;
+    const pz = this.planeMesh?.position.z ?? 0;
+    const maxDist = 15000;
+    for (const cloud of this.cloudMeshes) {
+      const speed = (cloud as any)._cloudDriftSpeed as number;
+      cloud.position.x += wx * dt * speed;
+      cloud.position.z += wz * dt * speed;
+      // Wrap: teleport to opposite side of player when too far away
+      const dx = cloud.position.x - px;
+      const dz = cloud.position.z - pz;
+      if (Math.abs(dx) > maxDist) cloud.position.x -= Math.sign(dx) * maxDist * 2;
+      if (Math.abs(dz) > maxDist) cloud.position.z -= Math.sign(dz) * maxDist * 2;
+    }
+  }
+
   ngOnDestroy(): void {
     if (this.weatherRefreshId !== null) clearInterval(this.weatherRefreshId);
     window.removeEventListener('keydown',   this.boundKeyDown);
@@ -3666,6 +3900,12 @@ export class GameComponent implements OnInit, OnDestroy {
     this.disposeBombBayDoors();
     this.fireSystem?.dispose();
     this.smokeSystem?.dispose();
+    // Cloud & sky cleanup
+    this.cloudParticleSystems.forEach(ps => ps.dispose());
+    this.cloudMeshes.forEach(m  => m.dispose());
+    this.cloudTextures.forEach(t => t.dispose());
+    this.skyDome?.dispose();
+    this.skyMat?.dispose();
     this.engine?.dispose();
   }
 }
