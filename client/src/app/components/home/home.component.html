@@ -15,7 +15,12 @@
       </div>
     </div>
 
-    <a class="btn btn-primary" routerLink="/game">Fly Now</a>
+    <!-- Fly Now — gated: must be logged in AND server must be reachable -->
+    <button class="btn btn-primary" (click)="flyNow()" [disabled]="flyingCheck">
+      {{ flyingCheck ? 'Checking…' : 'Fly Now' }}
+    </button>
+
+    <div class="fly-error" *ngIf="flyError">{{ flyError }}</div>
 
     <div class="auth-links" *ngIf="!user?.loggedIn">
       <a routerLink="/login">Login</a>

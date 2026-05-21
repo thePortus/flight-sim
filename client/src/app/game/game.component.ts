@@ -218,7 +218,7 @@ interface OtherPlayer {
         <div class="hud-row">THR &nbsp; {{ throttle * 100 | number:'1.0-0' }}%</div>
         <div class="hud-stall" *ngIf="stalling">&#9888; STALL</div>
         <div class="hud-bomb-bay" *ngIf="bombBayOpen">&#9673; BOMB BAY OPEN</div>
-        <div class="hud-gear-up" *ngIf="retractableGear && !gearDown">&#9651; GEAR UP</div>
+        <div class="hud-gear-down" *ngIf="retractableGear && gearDown">&#9661; GEAR DOWN</div>
         <div class="hud-land" *ngIf="landingMsg">&#10003; {{ landingMsg }}</div>
         <div class="hud-gnd"  *ngIf="landed">GND &nbsp; {{ landedAt }}</div>
         <div class="hud-row hud-cam">CAM &nbsp; {{ cameraMode }}</div>
@@ -312,12 +312,11 @@ interface OtherPlayer {
       letter-spacing: 2px;
       animation: stall-blink 1.2s step-end infinite;
     }
-    .hud-gear-up {
+    .hud-gear-down {
       font-size: 13px;
       font-weight: bold;
-      color: #ff4444;
+      color: #44aaff;
       letter-spacing: 2px;
-      animation: stall-blink 1.2s step-end infinite;
     }
     .hud-stall {
       font-size: 13px;
@@ -543,8 +542,10 @@ export class GameComponent implements OnInit, OnDestroy {
   // ── Hydrography ──────────────────────────────────────────────────────
   private hydroMeshes      = new Map<number, Mesh>();
   private isFetchingHydro  = false;
+  private hydroFeatures:   GameHydrography[] = [];  // cached for terrain depression
   private waterMat!: WaterMaterial;
   private waterRenderMeshes = new Set<Mesh>();  // non-water meshes reflected by waterMat
+  private oceanPlaneMesh:  Mesh | null = null;  // single global ocean surface
 
   // ── Terrain ──────────────────────────────────────────────────────────────
   private terrainMeshes        = new Map<string, Mesh>();
@@ -821,6 +822,20 @@ export class GameComponent implements OnInit, OnDestroy {
   private fireSystem:   ParticleSystem | null = null;
   private smokeSystem:  ParticleSystem | null = null;
 
+  // ── Engine audio (Web Audio API — synthesised piston-engine sound) ────────
+  private audioCtx:       AudioContext   | null = null;
+  private engMasterGain:  GainNode       | null = null;
+  private engOsc1:        OscillatorNode | null = null;  // fundamental
+  private engOsc2:        OscillatorNode | null = null;  // 2nd harmonic
+  private engOsc3:        OscillatorNode | null = null;  // 3rd harmonic (square)
+  private engLfo:         OscillatorNode | null = null;  // cylinder-fire wobble
+  private engLfoGain:     GainNode       | null = null;
+  private engFilter:      BiquadFilterNode | null = null;
+
+  // ── One-shot SFX (crash, guns, explosions) ───────────────────────────────
+  private sfxCtx:         AudioContext   | null = null;
+  private sfxNoiseBuf:    AudioBuffer    | null = null;
+
   constructor(private ngZone: NgZone, private _router: Router,
               private _auth: AuthService, private _user: UserService) {}
 
@@ -837,6 +852,9 @@ export class GameComponent implements OnInit, OnDestroy {
     this.boundKeyDown = (e: KeyboardEvent) => {
       if (e.key === ' ') e.preventDefault(); // prevent page scroll
       this.keys.add(e.key);
+      // Unlock / create engine audio on the first user gesture (browser policy)
+      if (!this.audioCtx) this.initEngineAudio();
+      else if (this.audioCtx.state === 'suspended') this.audioCtx.resume();
     };
     this.boundKeyUp = (e: KeyboardEvent) => {
       this.keys.delete(e.key);
@@ -1042,6 +1060,10 @@ export class GameComponent implements OnInit, OnDestroy {
     this.waterMat.waveSpeed      = 1.4;
     // Sun sphere and sky in the reflection so water mirrors the sky
     this.waterMat.addToRenderList(sunSphere);
+
+    // Single continuous ocean surface — replaces per-tile ocean meshes so
+    // there are no rectangular tile edges visible in the water.
+    this.buildOceanMesh(scene);
 
     // ── Terrain biome materials ──────────────────────────────────────────────
     this.forestMat = new StandardMaterial('forestMat', scene);
@@ -1264,6 +1286,7 @@ export class GameComponent implements OnInit, OnDestroy {
     if (this.keys.has('Control')) {
       this.throttle = Math.max(0, this.throttle - this.THROTTLE_RATE * dt);
     }
+    this.updateEngineAudio();
 
     // Machine guns — Space fires when airborne (P-51 only for now)
     if (this.machineGunsEnabled && this.keys.has(' ') && !this.landed) {
@@ -1486,6 +1509,7 @@ export class GameComponent implements OnInit, OnDestroy {
     }
     if (!this.lastTerrainFetchPos || Vector3.Distance(flatPos, this.lastTerrainFetchPos) > this.TERRAIN_REFETCH_DIST) {
       this.fetchTerrain();
+      this.fetchHydrography();  // keep hydro in sync with terrain tiles
     }
     if (!this.lastRoadFetchPos || Vector3.Distance(flatPos, this.lastRoadFetchPos) > this.ROAD_REFETCH_DIST) {
       this.fetchRoads();
@@ -1571,10 +1595,10 @@ export class GameComponent implements OnInit, OnDestroy {
     if (this.isFetchingHydro) return;
     this.isFetchingHydro = true;
 
-    // Use a large radius — water features are static, one fetch covers the area
+    // Match terrain fetch radius so depression carving covers all loaded tiles
     const px = this.planeMesh.position.x;
     const pz = this.planeMesh.position.z;
-    const r  = 3000;
+    const r  = this.TERRAIN_FETCH_RADIUS;
     const url = `${Settings.apiUrl}hydrography?minX=${px - r}&maxX=${px + r}&minZ=${pz - r}&maxZ=${pz + r}`;
 
     fetch(url)
@@ -1587,7 +1611,72 @@ export class GameComponent implements OnInit, OnDestroy {
       .finally(() => { this.isFetchingHydro = false; });
   }
 
+  /**
+   * Build a single large spherically-curved ocean mesh that covers the entire
+   * world extent.  Using one continuous surface instead of per-tile ocean meshes
+   * eliminates all rectangular tile seams visible in the water.
+   *
+   * The mesh is generated in absolute world coordinates (mesh.position = zero)
+   * so vertex Y positions are computed with sphereSurfaceY to match the planet
+   * curvature used by terrain tiles.  The water level sits 0.5 units above the
+   * terrain-zero plane so beaches (h≈0) appear gently flooded and land rises
+   * naturally above the surface as the coast-blend gradient kicks in.
+   */
+  private buildOceanMesh(scene: Scene): void {
+    const EXTENT  = 90000;    // slightly beyond ±80 k world range
+    const STEPS   = 32;       // 33 × 33 vertices = 1024 quads
+    const STEP_SZ = (2 * EXTENT) / STEPS;
+    const SEA_Y   = 0.0;      // ocean flush with terrain zero — land tiles
+    // always render above ocean because their min vertex height is 0.02 (set
+    // in updateTerrainMeshes), so the ocean is always strictly below land.
+
+    const positions: number[] = [];
+    const normals:   number[] = [];
+    const uvs:       number[] = [];
+    const indices:   number[] = [];
+    const N = STEPS + 1;
+
+    for (let row = 0; row <= STEPS; row++) {
+      for (let col = 0; col <= STEPS; col++) {
+        const wx = -EXTENT + col * STEP_SZ;
+        const wz = -EXTENT + row * STEP_SZ;
+        positions.push(wx, this.sphereSurfaceY(wx, wz) + SEA_Y, wz);
+        uvs.push(col / STEPS, row / STEPS);
+      }
+    }
+    for (let row = 0; row < STEPS; row++) {
+      for (let col = 0; col < STEPS; col++) {
+        const a = row * N + col, b = a + 1, c = a + N, d = c + 1;
+        indices.push(a, b, c, b, d, c);
+      }
+    }
+    VertexData.ComputeNormals(positions, indices, normals);
+
+    const vd = new VertexData();
+    vd.positions = positions; vd.indices = indices;
+    vd.normals   = normals;   vd.uvs     = uvs;
+
+    this.oceanPlaneMesh = new Mesh('ocean-plane', scene);
+    vd.applyToMesh(this.oceanPlaneMesh, false);
+    this.oceanPlaneMesh.position    = Vector3.Zero();
+    this.oceanPlaneMesh.material    = this.waterMat;
+    this.oceanPlaneMesh.isPickable  = false;
+    // Give the ocean a render order behind terrain so depth sorting works
+    this.oceanPlaneMesh.alphaIndex  = -1;
+  }
+
   private updateHydroMeshes(features: GameHydrography[]): void {
+    // Merge into the cached list (no duplicates) and invalidate terrain tiles
+    // that overlap new features so they rebuild with valley/basin carving applied.
+    const newFeatures: GameHydrography[] = [];
+    for (const f of features) {
+      if (!this.hydroFeatures.find(x => x.id === f.id)) {
+        this.hydroFeatures.push(f);
+        newFeatures.push(f);
+      }
+    }
+    if (newFeatures.length > 0) this.invalidateTerrainNearHydro(newFeatures);
+
     for (const h of features) {
       if (this.hydroMeshes.has(h.id)) continue;
 
@@ -1604,7 +1693,7 @@ export class GameComponent implements OnInit, OnDestroy {
             width: len, height: 0.15, depth: h.width,
           }, this.scene);
           seg.position   = new Vector3(midX, this.sphereSurfaceY(midX, midZ) + 0.05, midZ);
-          seg.rotation.y = -Math.atan2(dx, dz);
+          seg.rotation.y = Math.atan2(dz, dx);
           seg.material   = this.waterMat;
           seg.isPickable = false;
           segs.push(seg);
@@ -1612,16 +1701,22 @@ export class GameComponent implements OnInit, OnDestroy {
         if (segs.length > 0) this.hydroMeshes.set(h.id, segs[0]);
 
       } else if (h.shapePoints && h.shapePoints.length >= 3) {
-        // Render lake as polygon fan mesh
+        // Render lake as polygon fan mesh with proper UV coords so the water
+        // shader animates correctly.  UVs are normalised (dx,dz)/maxR → [0,1].
+        const maxR = h.shapePoints.reduce(
+          (m, p) => Math.max(m, Math.hypot(p.dx, p.dz)), 1);
         const surfaceY  = this.sphereSurfaceY(h.x, h.z) + 0.05;
         const positions: number[] = [];
         const indices:   number[] = [];
         const normals:   number[] = [];
+        const uvs:       number[] = [];
         // Vertex 0 = center
         positions.push(h.x, surfaceY, h.z);
+        uvs.push(0.5, 0.5);
         for (const p of h.shapePoints) {
           const vY = this.sphereSurfaceY(h.x + p.dx, h.z + p.dz) + 0.05;
           positions.push(h.x + p.dx, vY, h.z + p.dz);
+          uvs.push(0.5 + p.dx / (2 * maxR), 0.5 + p.dz / (2 * maxR));
         }
         const N = h.shapePoints.length;
         for (let i = 1; i <= N; i++) {
@@ -1632,6 +1727,7 @@ export class GameComponent implements OnInit, OnDestroy {
         vd.positions = positions;
         vd.indices   = indices;
         vd.normals   = normals;
+        vd.uvs       = uvs;
         const mesh = new Mesh(`hydro-${h.id}`, this.scene);
         vd.applyToMesh(mesh, false);
         mesh.material   = this.waterMat;
@@ -1648,6 +1744,145 @@ export class GameComponent implements OnInit, OnDestroy {
         mesh.isPickable = false;
         this.hydroMeshes.set(h.id, mesh);
       }
+    }
+  }
+
+  // ── Water-terrain integration helpers ───────────────────────────────────────
+
+  /** Squared distance from point (px,pz) to segment (ax,az)→(bx,bz). */
+  private ptSegDist(px: number, pz: number, ax: number, az: number, bx: number, bz: number): number {
+    const dx = bx - ax, dz = bz - az;
+    const lenSq = dx * dx + dz * dz;
+    if (lenSq < 0.001) return Math.hypot(px - ax, pz - az);
+    const t = Math.max(0, Math.min(1, ((px - ax) * dx + (pz - az) * dz) / lenSq));
+    return Math.hypot(px - (ax + t * dx), pz - (az + t * dz));
+  }
+
+  /**
+   * Carve river valleys and lake basins into a tile's height array in-place.
+   * Heights grade smoothly down to 0 near water features so terrain
+   * visually flows into rivers and lakes rather than cutting off abruptly.
+   */
+  private applyWaterDepressions(tile: TerrainTile): void {
+    const N           = tile.resolution;
+    const step        = tile.size / (N - 1);
+    const RIVER_BLEND = 400;   // units of valley-wall transition for rivers
+    const LAKE_BLEND  = 350;   // units of basin-rim transition for lakes
+
+    // Cheap spatial pre-filter: skip features that can't possibly reach this tile.
+    // Rivers are checked against every waypoint (not just the midpoint stored in f.x/f.z)
+    // so that long rivers carve terrain across all tiles they cross.
+    const tMinX = tile.worldX, tMaxX = tile.worldX + tile.size;
+    const tMinZ = tile.worldZ, tMaxZ = tile.worldZ + tile.size;
+    const inRange = (fx: number, fz: number, reach: number) =>
+      fx > tMinX - reach && fx < tMaxX + reach &&
+      fz > tMinZ - reach && fz < tMaxZ + reach;
+
+    const nearby = this.hydroFeatures.filter(f => {
+      if (f.type === 'river' && f.waypoints && f.waypoints.length >= 2) {
+        const reach = RIVER_BLEND + (f.width ?? 15) / 2 + 1;
+        return f.waypoints.some(pt => inRange(pt.x, pt.z, reach));
+      }
+      // Lakes: use center + outermost shape radius (or half of width/depth)
+      const lakeR = f.shapePoints && f.shapePoints.length >= 3
+        ? f.shapePoints.reduce((mx, p) => Math.max(mx, Math.hypot(p.dx, p.dz)), 0)
+        : Math.max(f.width, f.depth) / 2;
+      return inRange(f.x, f.z, LAKE_BLEND + lakeR);
+    });
+    if (nearby.length === 0) return;
+
+    for (let row = 0; row < N; row++) {
+      for (let col = 0; col < N; col++) {
+        const vx  = tile.worldX + col * step;
+        const vz  = tile.worldZ + row * step;
+        const idx = row * N + col;
+        const nat = tile.heights[idx];
+        if (nat <= 0) continue;   // already at sea level — nothing to carve
+
+        let minFactor = 1.0;      // 0 = fully depressed, 1 = untouched
+
+        for (const feat of nearby) {
+          if (feat.type === 'river' && feat.waypoints && feat.waypoints.length >= 2) {
+            // Find the closest point on any waypoint segment
+            const halfW = (feat.width ?? 15) / 2;
+            let minDist = Infinity;
+            const wpts = feat.waypoints;
+            for (let i = 0; i < wpts.length - 1; i++) {
+              minDist = Math.min(minDist,
+                this.ptSegDist(vx, vz, wpts[i].x, wpts[i].z, wpts[i + 1].x, wpts[i + 1].z));
+            }
+            if (minDist <= halfW) {
+              minFactor = 0;                                         // inside river bed
+            } else if (minDist < halfW + RIVER_BLEND) {
+              const t = (minDist - halfW) / RIVER_BLEND;
+              minFactor = Math.min(minFactor, t * t);               // concave valley wall
+            }
+
+          } else if (feat.type === 'lake') {
+            // Lake radius: use the outermost shapePoint or fall back to width/depth
+            let lakeR: number;
+            if (feat.shapePoints && feat.shapePoints.length >= 3) {
+              lakeR = feat.shapePoints.reduce(
+                (mx, p) => Math.max(mx, Math.hypot(p.dx, p.dz)), 0);
+            } else {
+              lakeR = Math.max(feat.width, feat.depth) / 2;
+            }
+            const dist = Math.hypot(vx - feat.x, vz - feat.z) - lakeR;
+            if (dist <= 0) {
+              minFactor = 0;                                         // inside lake
+            } else if (dist < LAKE_BLEND) {
+              const t = dist / LAKE_BLEND;
+              minFactor = Math.min(minFactor, t * t);               // concave basin rim
+            }
+          }
+        }
+
+        if (minFactor < 1.0) {
+          tile.heights[idx] = parseFloat((nat * minFactor).toFixed(2));
+        }
+      }
+    }
+  }
+
+  /**
+   * Dispose terrain tiles that overlap newly-loaded water features so they
+   * rebuild on the next fetch with water depressions already carved in.
+   */
+  private invalidateTerrainNearHydro(features: GameHydrography[]): void {
+    const TILE_SIZE   = 4000;
+    const INFLUENCE   = 500;   // extra margin beyond tile edge
+    const toDispose: string[] = [];
+
+    for (const [id] of this.terrainMeshes) {
+      const parts = id.split('_');
+      const tx = parseInt(parts[0], 10), tz = parseInt(parts[1], 10);
+      const tMinX = tx * TILE_SIZE, tMaxX = tMinX + TILE_SIZE;
+      const tMinZ = tz * TILE_SIZE, tMaxZ = tMinZ + TILE_SIZE;
+
+      const overlaps = features.some(f =>
+        f.x > tMinX - INFLUENCE && f.x < tMaxX + INFLUENCE &&
+        f.z > tMinZ - INFLUENCE && f.z < tMaxZ + INFLUENCE
+      );
+      if (overlaps) toDispose.push(id);
+    }
+
+    for (const id of toDispose) {
+      const mesh = this.terrainMeshes.get(id)!;
+      if (this.waterRenderMeshes.has(mesh)) {
+        this.waterMat.removeFromRenderList(mesh);
+        this.waterRenderMeshes.delete(mesh);
+      }
+      mesh.dispose();
+      this.terrainMeshes.delete(id);
+      this.terrainTileData.delete(id);
+      const trees = this.treeMeshes.get(id);
+      if (trees) { trees.forEach(t => t.dispose()); this.treeMeshes.delete(id); }
+    }
+
+    // Force an immediate terrain re-fetch if any tiles were invalidated
+    if (toDispose.length > 0) {
+      this.lastTerrainFetchPos = null;
+      this.fetchTerrain();
     }
   }
 
@@ -1696,6 +1931,14 @@ export class GameComponent implements OnInit, OnDestroy {
     for (const tile of tiles) {
       if (this.terrainMeshes.has(tile.id)) continue;
 
+      // Ocean tiles are covered by the single global ocean plane mesh —
+      // skip them here so no rectangular tile edges appear in the water.
+      if (tile.groundCover === 'ocean') continue;
+
+      // Carve river valleys and lake basins into the height array before
+      // building vertices so the mesh naturally slopes into water features.
+      if (this.hydroFeatures.length > 0) this.applyWaterDepressions(tile);
+
       const N    = tile.resolution;
       const S    = tile.size;
       const step = S / (N - 1);
@@ -1718,7 +1961,10 @@ export class GameComponent implements OnInit, OnDestroy {
           const localZ  = -S / 2 + row * step;
           const worldVX = tile.worldX + S / 2 + localX;
           const worldVZ = tile.worldZ + S / 2 + localZ;
-          const h       = tile.heights[row * N + col];
+          // Clamp to a minimum of 0.02 so the ocean plane (at 0.0) is always
+          // strictly below land tile vertices — prevents the ocean showing
+          // through flat coastal/spawn terrain where the server returns h = 0.
+          const h       = Math.max(0.02, tile.heights[row * N + col]);
           const drop    = this.sphereSurfaceY(worldVX, worldVZ);
           positions.push(localX, h + drop, localZ);
           uvs.push(col / (N - 1), row / (N - 1));
@@ -1746,15 +1992,12 @@ export class GameComponent implements OnInit, OnDestroy {
       mesh.position    = new Vector3(tile.worldX + S / 2, 0, tile.worldZ + S / 2);
       mesh.isPickable  = false;
 
-      if (tile.groundCover === 'ocean') {
-        // Ocean tiles use the animated WaterMaterial — don't add to its own render list
-        mesh.material = this.waterMat;
-      } else {
-        // Land tiles use vertex colours and feed the water reflection render target
-        mesh.material = this.terrainVCMat;
-        this.waterMat.addToRenderList(mesh);
-        this.waterRenderMeshes.add(mesh);
-      }
+      // All tiles reaching here are land — ocean tiles are handled by the global
+      // ocean plane and skipped above.  Land tiles use vertex colours and feed
+      // the water reflection render target so the ocean mirrors the scenery.
+      mesh.material = this.terrainVCMat;
+      this.waterMat.addToRenderList(mesh);
+      this.waterRenderMeshes.add(mesh);
 
       this.terrainMeshes.set(tile.id, mesh);
       this.terrainTileData.set(tile.id, tile);
@@ -2191,6 +2434,7 @@ export class GameComponent implements OnInit, OnDestroy {
 
   /** Creates a fire + rising smoke explosion at the given world-space impact position. */
   private createExplosion(pos: Vector3): void {
+    this.playExplosionSound();
     // ── Shared procedural textures ─────────────────────────────────────────
     const fireTex  = new DynamicTexture(`expFireTex-${Date.now()}`,  { width: 64, height: 64 }, this.scene, false);
     const fCtx     = fireTex.getContext() as CanvasRenderingContext2D;
@@ -2315,24 +2559,34 @@ export class GameComponent implements OnInit, OnDestroy {
 
     const W = canvas.width;   // 860
     const H = canvas.height;  // 860
-    const WORLD_RANGE = 70000;
-    const scale = W / (2 * WORLD_RANGE);
+    const VIEW_RANGE = 60000; // world units visible from centre to edge
+    const scale = W / (2 * VIEW_RANGE);
     const TILE  = 4000;
 
-    // World → canvas: North (+Z) = up, East (+X) = right
-    const toMX = (wx: number) => W / 2 + wx * scale;
-    const toMY = (wz: number) => H / 2 - wz * scale;
+    // Player position — the map is always centred here
+    const px = this.planeMesh.position.x;
+    const pz = this.planeMesh.position.z;
+
+    // World → canvas: North (+Z) = up, East (+X) = right, player always at centre
+    const toMX = (wx: number) => W / 2 + (wx - px) * scale;
+    const toMY = (wz: number) => H / 2 - (wz - pz) * scale;
 
     // Background
     ctx.fillStyle = '#06091a';
     ctx.fillRect(0, 0, W, H);
 
-    // Subtle grid lines every 10 000 units
-    ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+    // Grid lines every 10 000 units — snap to world-space grid regardless of player pos
+    ctx.strokeStyle = 'rgba(255,255,255,0.06)';
     ctx.lineWidth   = 0.5;
-    for (let g = -70000; g <= 70000; g += 10000) {
-      ctx.beginPath(); ctx.moveTo(toMX(g), 0);  ctx.lineTo(toMX(g), H); ctx.stroke();
-      ctx.beginPath(); ctx.moveTo(0, toMY(g));  ctx.lineTo(W, toMY(g)); ctx.stroke();
+    const gx0 = Math.floor((px - VIEW_RANGE) / 10000) * 10000;
+    const gz0 = Math.floor((pz - VIEW_RANGE) / 10000) * 10000;
+    for (let g = gx0; g <= px + VIEW_RANGE; g += 10000) {
+      const cx = toMX(g);
+      ctx.beginPath(); ctx.moveTo(cx, 0); ctx.lineTo(cx, H); ctx.stroke();
+    }
+    for (let g = gz0; g <= pz + VIEW_RANGE; g += 10000) {
+      const cy = toMY(g);
+      ctx.beginPath(); ctx.moveTo(0, cy); ctx.lineTo(W, cy); ctx.stroke();
     }
 
     // ── Terrain tiles ──────────────────────────────────────────────────────
@@ -2348,9 +2602,12 @@ export class GameComponent implements OnInit, OnDestroy {
         coastal:   '#6ba85a',
       };
       for (const t of this.mapOverview) {
+        const tx = toMX(t.worldX);
+        const ty = toMY(t.worldZ + TILE);
+        // Cull tiles that are completely off-canvas
+        if (tx > W || ty > H || tx + tileSize < 0 || ty + tileSize < 0) continue;
         ctx.fillStyle = COLORS[t.groundCover] ?? '#3a6030';
-        // worldZ is the south edge; north edge = worldZ + TILE_SIZE
-        ctx.fillRect(toMX(t.worldX), toMY(t.worldZ + TILE), tileSize + 0.6, tileSize + 0.6);
+        ctx.fillRect(tx, ty, tileSize + 0.6, tileSize + 0.6);
       }
     }
 
@@ -2384,7 +2641,6 @@ export class GameComponent implements OnInit, OnDestroy {
       ctx.lineWidth   = 1.5;
       ctx.strokeRect(mx - 4, my - 4, 8, 8);
 
-      // Inner cross representing runways
       ctx.beginPath();
       ctx.moveTo(mx - 4, my); ctx.lineTo(mx + 4, my);
       ctx.moveTo(mx, my - 4); ctx.lineTo(mx, my + 4);
@@ -2396,14 +2652,12 @@ export class GameComponent implements OnInit, OnDestroy {
       ctx.fillText(airport.code, mx, my - 7);
     }
 
-    // ── Player position (red arrow) ────────────────────────────────────────
-    const px = this.planeMesh.position.x;
-    const pz = this.planeMesh.position.z;
+    // ── Player arrow (always dead-centre) ─────────────────────────────────
     const fwd     = this.planeMesh.getDirection(Axis.Z);
     const heading = Math.atan2(fwd.x, fwd.z);
 
     ctx.save();
-    ctx.translate(toMX(px), toMY(pz));
+    ctx.translate(W / 2, H / 2);
     ctx.rotate(heading);
     ctx.fillStyle = '#ff3030';
     ctx.strokeStyle = '#ffffff';
@@ -2414,6 +2668,7 @@ export class GameComponent implements OnInit, OnDestroy {
     ctx.fill(); ctx.stroke();
     ctx.restore();
 
+    // ── Scale bar (10 000 units) ───────────────────────────────────────────
     // ── Scale bar (10 000 units) ───────────────────────────────────────────
     const barLen = 10000 * scale;
     const bx = W - barLen - 18, by = H - 18;
@@ -2453,6 +2708,13 @@ export class GameComponent implements OnInit, OnDestroy {
     ctx.fillStyle = 'rgba(255,255,255,0.65)';
     ctx.textAlign = 'center';
     ctx.fillText('WORLD MAP', W / 2, 16);
+
+    // ── Player coordinates (bottom-left) ───────────────────────────────────
+    const coordStr = `X: ${Math.round(px).toLocaleString()}   Z: ${Math.round(pz).toLocaleString()}`;
+    ctx.font      = '10px monospace';
+    ctx.fillStyle = 'rgba(200,220,255,0.75)';
+    ctx.textAlign = 'left';
+    ctx.fillText(coordStr, 14, H - 8);
   }
 
   private updateMinimap(): void {
@@ -2607,6 +2869,7 @@ export class GameComponent implements OnInit, OnDestroy {
    */
   private fireGuns(): void {
     if (this.gunPositions.length === 0) return;
+    this.playGunSound();
     const wm      = this.planeMesh.getWorldMatrix();
     const forward = this.planeMesh.getDirection(Axis.Z);
     const velocity = this.velocity.add(forward.scale(this.TRACER_SPEED));
@@ -2901,6 +3164,8 @@ export class GameComponent implements OnInit, OnDestroy {
 
   private handleCrash(message: string): void {
     if (this.crashed) return; // guard: crash detection can fire twice in one frame
+    this.playCrashSound();       // boom before engine is silenced
+    this.destroyEngineAudio();   // kill engine oscillators immediately
     this.triggerCrashAnimation();
     this.crashed      = true;
     this.crashMessage = message;
@@ -3873,12 +4138,286 @@ export class GameComponent implements OnInit, OnDestroy {
     }
   }
 
+  // ── Engine audio ────────────────────────────────────────────────────────────
+
+  /**
+   * Build a synthesised piston-engine sound using the Web Audio API.
+   * Three harmonic oscillators (sawtooth + square) pass through a low-pass
+   * filter and a master gain node.  A slow LFO (~7 Hz) wobbles all oscillator
+   * frequencies slightly to mimic individual cylinder firings.
+   *
+   * Must be called from a user-gesture handler (keydown) so the browser
+   * allows the AudioContext to play.
+   */
+  private initEngineAudio(): void {
+    try {
+      const ctx = new AudioContext();
+      this.audioCtx = ctx;
+      ctx.resume();   // push past 'suspended' state immediately on user gesture
+
+      // Master gain — controls overall engine volume
+      const master = ctx.createGain();
+      master.gain.value = 0.10;  // idle volume (raised so laptop speakers can hear it)
+      master.connect(ctx.destination);
+      this.engMasterGain = master;
+
+      // Low-pass filter — mellows the sawtooth wave into something less buzzy
+      const filter = ctx.createBiquadFilter();
+      filter.type            = 'lowpass';
+      filter.frequency.value = 350;
+      filter.Q.value         = 0.7;
+      filter.connect(master);
+      this.engFilter = filter;
+
+      // Per-harmonic gain nodes (relative mix)
+      const g1 = ctx.createGain(); g1.gain.value = 0.60; g1.connect(filter);
+      const g2 = ctx.createGain(); g2.gain.value = 0.28; g2.connect(filter);
+      const g3 = ctx.createGain(); g3.gain.value = 0.12; g3.connect(filter);
+
+      // Oscillator 1 — fundamental (sawtooth, richest in harmonics)
+      const osc1 = ctx.createOscillator();
+      osc1.type = 'sawtooth'; osc1.frequency.value = 90;  // 90 Hz idle
+      osc1.connect(g1); osc1.start();
+
+      // Oscillator 2 — 2nd harmonic (sawtooth)
+      const osc2 = ctx.createOscillator();
+      osc2.type = 'sawtooth'; osc2.frequency.value = 180;
+      osc2.connect(g2); osc2.start();
+
+      // Oscillator 3 — 3rd harmonic (square adds odd harmonics = grittier)
+      const osc3 = ctx.createOscillator();
+      osc3.type = 'square'; osc3.frequency.value = 270;
+      osc3.connect(g3); osc3.start();
+
+      this.engOsc1 = osc1; this.engOsc2 = osc2; this.engOsc3 = osc3;
+
+      // LFO — a slow sine (~7 Hz) wobbles all three oscillator frequencies
+      // slightly to simulate uneven cylinder firing and engine vibration.
+      const lfo     = ctx.createOscillator();
+      const lfoGain = ctx.createGain();
+      lfo.type            = 'sine';
+      lfo.frequency.value = 7;
+      lfoGain.gain.value  = 3;   // ±3 Hz frequency wobble
+      lfo.connect(lfoGain);
+      lfoGain.connect(osc1.frequency);
+      lfoGain.connect(osc2.frequency);
+      lfoGain.connect(osc3.frequency);
+      lfo.start();
+      this.engLfo = lfo; this.engLfoGain = lfoGain;
+
+    } catch (_) { /* AudioContext unavailable */ }
+  }
+
+  /**
+   * Called every physics frame.  Maps the current throttle (0–1) to frequency,
+   * volume and filter cutoff using gentle power curves so changes feel organic
+   * rather than linear.  All transitions use setTargetAtTime (exponential slew)
+   * so the sound ramps smoothly even when throttle steps quickly.
+   */
+  private updateEngineAudio(): void {
+    if (!this.audioCtx) return;
+    // Note: schedule setTargetAtTime even when suspended — the AudioContext
+    // queues the events and applies them the moment it becomes 'running'.
+    const t   = this.audioCtx.currentTime;
+    const tau = 0.08;   // 80 ms time constant — smooth but responsive
+    const thr = this.throttle;
+
+    // Pitch: idle ~90 Hz → full-throttle ~180 Hz.  Floor raised to 90 Hz
+    // so the engine is audible on laptop speakers (typical cut-off ~100 Hz).
+    const freq = 90 + 90 * Math.pow(thr, 0.65);
+    this.engOsc1!.frequency.setTargetAtTime(freq,      t, tau);
+    this.engOsc2!.frequency.setTargetAtTime(freq * 2,  t, tau);
+    this.engOsc3!.frequency.setTargetAtTime(freq * 3,  t, tau);
+
+    // Volume: 0.10 at idle (clearly audible), 0.40 at full throttle
+    const vol = 0.10 + 0.30 * Math.pow(thr, 0.55);
+    this.engMasterGain!.gain.setTargetAtTime(vol, t, tau);
+
+    // LFO wobble depth: rougher at idle (more cylinder-miss feel), smoother
+    // under power — matches how a real piston engine smooths out at high RPM
+    this.engLfoGain!.gain.setTargetAtTime(5 * (1 - thr * 0.65), t, tau);
+
+    // Filter opens up at high throttle → brighter, more aggressive tone
+    const cutoff = 280 + 550 * Math.pow(thr, 0.8);
+    this.engFilter!.frequency.setTargetAtTime(cutoff, t, tau);
+  }
+
+  /** Tear down all audio nodes when the game component is destroyed. */
+  private destroyEngineAudio(): void {
+    try {
+      this.engOsc1?.stop(); this.engOsc2?.stop();
+      this.engOsc3?.stop(); this.engLfo?.stop();
+      this.audioCtx?.close();
+    } catch (_) {}
+    this.audioCtx = null; this.engMasterGain = null; this.engFilter     = null;
+    this.engOsc1  = null; this.engOsc2       = null; this.engOsc3       = null;
+    this.engLfo   = null; this.engLfoGain    = null;
+  }
+
+  // ── One-shot SFX helpers ─────────────────────────────────────────────────
+
+  /**
+   * Returns (and lazily creates) the shared SFX AudioContext.
+   * Using a separate context from the engine keeps SFX alive after a crash.
+   */
+  private getSfxCtx(): AudioContext | null {
+    try {
+      if (!this.sfxCtx || this.sfxCtx.state === 'closed') {
+        this.sfxCtx    = new AudioContext();
+        this.sfxNoiseBuf = null; // reset cached buffer for new context
+      }
+      if (this.sfxCtx.state === 'suspended') this.sfxCtx.resume();
+      return this.sfxCtx;
+    } catch (_) { return null; }
+  }
+
+  /**
+   * Returns a 3-second white-noise AudioBuffer, created once per SFX context.
+   * All one-shot sounds share this buffer — each gets its own BufferSourceNode.
+   */
+  private getSfxNoise(): AudioBuffer | null {
+    const ctx = this.getSfxCtx();
+    if (!ctx) return null;
+    if (!this.sfxNoiseBuf) {
+      const len = Math.ceil(ctx.sampleRate * 3);
+      const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+      const d   = buf.getChannelData(0);
+      for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+      this.sfxNoiseBuf = buf;
+    }
+    return this.sfxNoiseBuf;
+  }
+
+  /**
+   * Crash sound — three layered noise bursts:
+   *   1. Deep low boom (lowpass 120 Hz) — the hull hitting the ground
+   *   2. Metallic rending (bandpass 800 Hz) — tearing metal
+   *   3. Whoosh ramp (highpass 2 kHz) — air/fire rush
+   */
+  private playCrashSound(): void {
+    const ctx = this.getSfxCtx();
+    const buf = this.getSfxNoise();
+    if (!ctx || !buf) return;
+    const now = ctx.currentTime;
+
+    // 1 — deep boom
+    const boom    = ctx.createBiquadFilter();
+    boom.type = 'lowpass'; boom.frequency.value = 120; boom.Q.value = 0.4;
+    const boomG   = ctx.createGain();
+    boomG.gain.setValueAtTime(1.5, now);
+    boomG.gain.exponentialRampToValueAtTime(0.0001, now + 2.8);
+    const s1 = ctx.createBufferSource(); s1.buffer = buf;
+    s1.connect(boom); boom.connect(boomG); boomG.connect(ctx.destination);
+    s1.start(now);
+
+    // 2 — metallic rending
+    const metal   = ctx.createBiquadFilter();
+    metal.type = 'bandpass'; metal.frequency.value = 850; metal.Q.value = 2.5;
+    const metalG  = ctx.createGain();
+    metalG.gain.setValueAtTime(0.55, now);
+    metalG.gain.exponentialRampToValueAtTime(0.0001, now + 1.2);
+    const s2 = ctx.createBufferSource(); s2.buffer = buf;
+    s2.connect(metal); metal.connect(metalG); metalG.connect(ctx.destination);
+    s2.start(now);
+
+    // 3 — high whoosh / fire rush (delayed ramp-in)
+    const whoosh  = ctx.createBiquadFilter();
+    whoosh.type = 'highpass'; whoosh.frequency.value = 2200;
+    const whooshG = ctx.createGain();
+    whooshG.gain.setValueAtTime(0.0001, now);
+    whooshG.gain.linearRampToValueAtTime(0.28, now + 0.18);
+    whooshG.gain.exponentialRampToValueAtTime(0.0001, now + 1.8);
+    const s3 = ctx.createBufferSource(); s3.buffer = buf;
+    s3.connect(whoosh); whoosh.connect(whooshG); whooshG.connect(ctx.destination);
+    s3.start(now);
+  }
+
+  /**
+   * Gun sound — a short sharp crack + low body thump, ~70 ms total.
+   * Called every TRACER_FIRE_INTERVAL (80 ms) so it naturally rates-limits itself.
+   */
+  private playGunSound(): void {
+    const ctx = this.getSfxCtx();
+    const buf = this.getSfxNoise();
+    if (!ctx || !buf) return;
+    const now = ctx.currentTime;
+
+    // Sharp high-frequency crack
+    const crack  = ctx.createBiquadFilter();
+    crack.type = 'bandpass'; crack.frequency.value = 3200; crack.Q.value = 0.7;
+    const crackG = ctx.createGain();
+    crackG.gain.setValueAtTime(0.40, now);
+    crackG.gain.exponentialRampToValueAtTime(0.0001, now + 0.07);
+    const s1 = ctx.createBufferSource(); s1.buffer = buf;
+    s1.connect(crack); crack.connect(crackG); crackG.connect(ctx.destination);
+    s1.start(now);
+
+    // Low body thump (chamber pressure)
+    const thump  = ctx.createBiquadFilter();
+    thump.type = 'lowpass'; thump.frequency.value = 200;
+    const thumpG = ctx.createGain();
+    thumpG.gain.setValueAtTime(0.30, now);
+    thumpG.gain.exponentialRampToValueAtTime(0.0001, now + 0.06);
+    const s2 = ctx.createBufferSource(); s2.buffer = buf;
+    s2.connect(thump); thump.connect(thumpG); thumpG.connect(ctx.destination);
+    s2.start(now);
+  }
+
+  /**
+   * Bomb-impact explosion — bigger, deeper version of crash with no metallic layer.
+   * Three bands:
+   *   1. Sub-bass thump (lowpass 80 Hz) — concussive shockwave
+   *   2. Mid rumble (bandpass 300 Hz)   — earth movement
+   *   3. Debris scatter (bandpass 1800 Hz, delayed) — rocks / fragments
+   */
+  private playExplosionSound(): void {
+    const ctx = this.getSfxCtx();
+    const buf = this.getSfxNoise();
+    if (!ctx || !buf) return;
+    const now = ctx.currentTime;
+
+    // 1 — sub-bass shockwave
+    const sub  = ctx.createBiquadFilter();
+    sub.type = 'lowpass'; sub.frequency.value = 80; sub.Q.value = 0.3;
+    const subG = ctx.createGain();
+    subG.gain.setValueAtTime(1.8, now);
+    subG.gain.exponentialRampToValueAtTime(0.0001, now + 2.2);
+    const s1 = ctx.createBufferSource(); s1.buffer = buf;
+    s1.connect(sub); sub.connect(subG); subG.connect(ctx.destination);
+    s1.start(now);
+
+    // 2 — mid rumble (delayed onset)
+    const mid  = ctx.createBiquadFilter();
+    mid.type = 'bandpass'; mid.frequency.value = 300; mid.Q.value = 0.5;
+    const midG = ctx.createGain();
+    midG.gain.setValueAtTime(0.0001, now);
+    midG.gain.linearRampToValueAtTime(0.65, now + 0.07);
+    midG.gain.exponentialRampToValueAtTime(0.0001, now + 2.6);
+    const s2 = ctx.createBufferSource(); s2.buffer = buf;
+    s2.connect(mid); mid.connect(midG); midG.connect(ctx.destination);
+    s2.start(now);
+
+    // 3 — debris scatter (more delayed, shorter)
+    const deb  = ctx.createBiquadFilter();
+    deb.type = 'bandpass'; deb.frequency.value = 1800; deb.Q.value = 1.2;
+    const debG = ctx.createGain();
+    debG.gain.setValueAtTime(0.0001, now);
+    debG.gain.linearRampToValueAtTime(0.22, now + 0.13);
+    debG.gain.exponentialRampToValueAtTime(0.0001, now + 1.0);
+    const s3 = ctx.createBufferSource(); s3.buffer = buf;
+    s3.connect(deb); deb.connect(debG); debG.connect(ctx.destination);
+    s3.start(now);
+  }
+
   ngOnDestroy(): void {
     if (this.weatherRefreshId !== null) clearInterval(this.weatherRefreshId);
     window.removeEventListener('keydown',   this.boundKeyDown);
     window.removeEventListener('keyup',     this.boundKeyUp);
     window.removeEventListener('resize',    this.boundResize);
     window.removeEventListener('pointerup', this.boundPointerUp);
+    this.destroyEngineAudio();
+    try { this.sfxCtx?.close(); } catch (_) {}
+    this.sfxCtx = null; this.sfxNoiseBuf = null;
     for (const m of this.planeParts)   m.dispose();
     for (const m of this.cockpitParts) m.dispose();
     for (const p of this.debrisPieces) p.mesh.dispose();

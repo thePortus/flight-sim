@@ -127,10 +127,18 @@ function generateTile(tileX, tileZ) {
       const baseH = warpedHeight(vx, vz);
       const env   = elevationEnvelope(vx, vz);
 
-      // Coast: transition from ocean height (0) to inland height
+      // Per-vertex coastal blending.  The blend extends ~3 600 world units
+      // (0.20 noise units × 18 000 scale) inland from the ocean boundary so
+      // land tile edges slope all the way to zero before the ocean begins —
+      // no cliff at the tile seam.  Quadratic ramp gives a concave beach.
+      const vContN = continentalNoise(vx, vz);
+      const vDist  = Math.sqrt(vx * vx + vz * vz);
       let coastMask = 1;
-      if (isCoast) {
-        coastMask = Math.max(0, (contN - 0.38) / 0.06);
+      if (vContN < 0.38 && vDist > 22000) {
+        coastMask = 0;                                         // ocean territory
+      } else if (vContN < 0.58 && vDist > 18000) {
+        const t = Math.max(0, (vContN - 0.38) / 0.20);
+        coastMask = t * t;                                     // concave beach ramp
       }
 
       // Softer exponent (1.15 vs 1.45) boosts mid-range heights so rolling

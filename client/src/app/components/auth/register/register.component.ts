@@ -2,14 +2,9 @@ import { Component, OnInit } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { Observable } from 'rxjs';
 import { NgForm, FormsModule } from '@angular/forms';
-import { Router} from '@angular/router';
-import { RouterLink } from '@angular/router';
+import { Router, RouterLink } from '@angular/router';
 
-import { MatInputModule } from '@angular/material/input';
-import { MatCardModule } from '@angular/material/card';
-import { MatFormFieldModule } from '@angular/material/form-field';
-import { MatButtonModule } from '@angular/material/button';
-
+import { MatSnackBarModule, MatSnackBar } from '@angular/material/snack-bar';
 
 import { ApiService } from './../../../services/api.service';
 import { AuthService } from './../../../services/auth.service';
@@ -17,92 +12,91 @@ import { User, UserService } from './../../../services/user.service';
 
 @Component({
   selector: 'app-register',
-  imports: [
-    RouterLink, MatInputModule, MatCardModule, MatButtonModule,
-    MatFormFieldModule, CommonModule, FormsModule
-  ],
+  imports: [RouterLink, CommonModule, FormsModule, MatSnackBarModule],
   standalone: true,
-  providers: [],
   templateUrl: './register.component.html',
   styleUrl: './register.component.scss'
 })
 export class RegisterComponent implements OnInit {
-   // local and server error messages
-   errorMessage: any;
-   showErrorMessage: boolean = false;
-   // observable and local object for user data
-   userDetails$!: Observable<User>;
-   user: any;
+  errorMessage: any;
+  showErrorMessage = false;
+  loading = false;
+  userDetails$!: Observable<User>;
+  user: any;
 
   constructor(
     private _api: ApiService,
     private _auth: AuthService,
     private _user: UserService,
-    private _router: Router
+    private _router: Router,
+    private _snackBar: MatSnackBar
   ) {}
 
   ngOnInit(): void {
- // check local storage data whether user is already logged in
     this.isUserLogin();
-    // get observable & set behavior on change
     this.userDetails$ = this._user.user$;
-    this.userDetails$.subscribe(result => {
-      this.user = result;
+    this.userDetails$.subscribe(result => { this.user = result; });
+  }
+
+  isUserLogin() {
+    if (this._auth.getUserDetails() != null) {
+      const d = JSON.parse(this._auth.getUserDetails()!);
+      this._user.login({ username: d.username, email: d.email, role: d.role, token: d.token });
+    }
+  }
+
+  onSubmit(form: NgForm) {
+    this.showErrorMessage = false;
+
+    if (form.value.password !== form.value.password2) {
+      this.errorMessage = 'Passwords must match.';
+      this.showErrorMessage = true;
+      return;
+    }
+
+    this.loading = true;
+    this._api.postTypeRequest('user/register', form.value).subscribe((res: any) => {
+      if (res.user) {
+        // Auto-login with the same credentials immediately after registration
+        this._api.postTypeRequest('user/login', {
+          username: form.value.username,
+          password: form.value.password,
+        }).subscribe((loginRes: any) => {
+          this.loading = false;
+          if (loginRes.token) {
+            this._auth.setDataInLocalStorage('userData', JSON.stringify(loginRes));
+            this._auth.setDataInLocalStorage('token', loginRes.token);
+            this._user.login({
+              username: loginRes.username,
+              email:    loginRes.email,
+              role:     loginRes.role,
+              token:    loginRes.token,
+            });
+            this._snackBar.open('Account created — welcome!', '', { duration: 3000 });
+            this._router.navigate(['']);
+          } else {
+            // Registered OK but auto-login didn't return a token — go to login
+            this._router.navigate(['/login']);
+          }
+        }, () => {
+          this.loading = false;
+          this._router.navigate(['/login']);
+        });
+      } else {
+        this.loading = false;
+        this.errorMessage = res.message || 'Registration failed.';
+        this.showErrorMessage = true;
+      }
+    }, (error: any) => {
+      this.loading = false;
+      this.errorMessage = error?.error?.message || 'Could not reach the server.';
+      this.showErrorMessage = true;
     });
   }
 
-  /**
-   * Uses auth service to see if user already has stored login data
-   * in local storage. If so, then uses the user service to
-   * store that data for the application.
-   */
-  isUserLogin() {
-    if(this._auth.getUserDetails() != null) {
-      const userDetails = JSON.parse(this._auth.getUserDetails()!);
-      this._user.login({
-        username: userDetails.username,
-        email: userDetails.email,
-        role: userDetails.role,
-        token: userDetails.token
-      });
-    }
-  }
-
-  /**
-   * Submits user data to server and stores local user data from server response.
-   * 
-   * @param form Form data with user registration info
-   */
-  onSubmit(form: NgForm) {
-    this.showErrorMessage = false;
-    // check for matching passwords
-    if (form.value.password !== form.value.password2) {
-      this.errorMessage = 'Error: passwords must match!';
-      this.showErrorMessage = true;
-    }
-    else {
-      this._api.postTypeRequest('user/register', form.value).subscribe((res: any) => {
-        // Server returns { message, user: { id, username, email } } on 201 — no token
-        if (res.user) {
-          this._router.navigate(['/login']);
-        } else {
-          this.errorMessage = res.message || 'Registration failed.';
-          this.showErrorMessage = true;
-        }
-      }, (error: any) => {
-        this.errorMessage = error?.error?.message || 'Could not reach the server.';
-        this.showErrorMessage = true;
-      });
-    }
-  }
-
-  /**
-   * Clears user data both from user service and from local storage
-   */
   logout() {
     this._auth.clearStorage();
     this._user.logout();
     this._router.navigate(['']);
   }
-
 }
